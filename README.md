@@ -57,10 +57,10 @@ The nodes adapt to the `moss-server` they find. When a run starts, they ask it f
 ## Install
 
 1. Put this folder in `ComfyUI/custom_nodes/`, as `ComfyUI/custom_nodes/ComfyUI-MossImage-owoinfer`. It needs nothing beyond what ComfyUI already has (torch, numpy, Pillow).
-2. Give it a `moss-server`. Download a MossInfer release for your OS and extract it into the pack's `bin/` folder:
+2. Give it a `moss-server`. Download a MossInfer release for your OS from [github.com/xycld/owoinfer/releases](https://github.com/xycld/owoinfer/releases) (check it against the release's `SHA256SUMS`) and extract it into the pack's `bin/` folder:
    ```sh
    mkdir -p ComfyUI/custom_nodes/ComfyUI-MossImage-owoinfer/bin
-   tar -xzf mossinfer-<version>-linux-cu13-x86_64.tar.gz -C ComfyUI/custom_nodes/ComfyUI-MossImage-owoinfer/bin/
+   tar -xzf mossinfer-1.0.0-linux-cu13-x86_64.tar.gz -C ComfyUI/custom_nodes/ComfyUI-MossImage-owoinfer/bin/
    ```
    On Windows, extract the `.zip` into `bin\` the same way. Keep the archive's `bin/` and `lib/` together, because `moss-server` loads the engine library from `../lib`.
    - **Which archive:** `cu13` by default. Take `cu12` when the NVIDIA driver is older than 580. The `-system-cuda` archives are smaller and need a compatible CUDA toolkit installed.
