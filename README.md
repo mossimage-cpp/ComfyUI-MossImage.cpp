@@ -24,10 +24,12 @@ The cost is that the nodes are a closed pipeline. You can't mix them with ComfyU
 - **LoRAs:** any number, chained. Formats: kohya, PEFT / diffusers, LyCORIS LoHa and LoKr, and full deltas.
 - **Control adapters**, such as the colour/depth control, and the lossy accelerators (CFG truncation, First-Block cache). Both need MossInfer 1.1 or later, and runs that use either are uncertified.
 - **Quality tiers** (`auto`, `reference`, `high`, `turbo` for INT4 files) and **memory modes** (`balanced`, `min_memory`, `max_speed`).
-- Progress bar, latent previews (off when ComfyUI's preview method is `none`) and the engine's warnings on the node. ComfyUI's Cancel stops a run within one layer or block.
+- Progress bar, latent previews (off when ComfyUI's preview method is `none`) and the engine's warnings on the node. With MossInfer 1.1 the bar covers the whole run (text encoder and model loads included) and the node shows the time remaining; with 1.0 it follows the sampling steps. ComfyUI's Cancel stops a run within one layer or block.
 - **After a run:** keep the model in VRAM, release the VRAM and keep the weights in RAM (MossInfer 1.1 and later), or unload it.
 
-The nodes ask the `moss-server` they find what it supports. A setting it lacks is refused with a message that names it, rather than sent anyway.
+The nodes ask the `moss-server` they find what it supports. A setting it lacks is refused with a message that names it, rather than sent anyway. With MossInfer 1.1, two more checks run before anything loads:
+- **Files:** the engine inspects each model file the run uses (DiT, text encoder, VAE, LoRAs, control adapter) and says what it is. A file in the wrong slot, a LoRA the engine can't use, a tier the DiT doesn't run, or a control `kind` the adapter doesn't have stops the run with the engine's reason. Results are kept per file until the file or the engine changes.
+- **Names:** the sampler, scheduler, attention, mode, tier and the other choices are checked against the names the server accepts, so an older server that lacks one says so and lists what it has.
 
 ## Requirements
 
@@ -170,7 +172,7 @@ The engine checks the values itself. When it refuses one, ComfyUI shows its mess
 
 - **The model folder is required in full.** The engine reads the folder's weight files even when single files replace all three parts, so a folder with only the configs and tokenizer is refused at the first run, e.g. `…/text_encoder: expected one .safetensors file or a shard index, found 0 files and no index`.
 - **A single checkpoint file can't be the model.** The loader picks a folder; ComfyUI files load next to it.
-- **INT4 DiT files need tier `turbo`, chosen by you.** Turbo is lossy and uncertified, so the pack never picks it. When you queue the workflow, an INT4 file with `auto` is refused with `INT4 DiT file: choose tier turbo (lossy, uncertified)`, and `turbo` with an INT8, bf16, FP8 or NVFP4 DiT, or the folder's own, is refused too. Other combinations go to the engine, which refuses what it does not run (e.g. `reference` with an INT8 file) with a message that names the conflict.
+- **INT4 DiT files need tier `turbo`, chosen by you.** Turbo is lossy and uncertified, so the pack never picks it. When you queue the workflow, an INT4 file with `auto` is refused with `INT4 DiT file: choose tier turbo (lossy, uncertified)` (unless the file has its own `<file>.mossinfer-cert.json` certificate), and `turbo` with an INT8, bf16, FP8 or NVFP4 DiT, or the folder's own, is refused too. With MossInfer 1.1, any other tier the DiT doesn't run (e.g. `reference` with an INT8 file, `high` with an INT4 one) is refused before the run loads anything, with the engine's reason; with 1.0, the engine refuses it at the first run.
 - **One image per run, one run at a time.** A batch on `init_image`, `mask` or a Control `image` uses its first item, with a warning. ComfyUI's queue runs generations in turn.
 - **Not with ComfyUI's model nodes:** no `MODEL` / `CLIP` / `VAE` / `LATENT`, no KSampler, no ComfyUI LoRA loaders.
 - **Formats the engine does not read:**
@@ -194,6 +196,10 @@ The engine checks the values itself. When it refuses one, ComfyUI shows its mess
 - **"moss-server not found":** extract a release into the pack's `bin/` or set `MOSSINFER_SERVER` (see [Getting moss-server](#getting-moss-server)). The error names the places it looked.
 - **`out_of_memory`:** use `min_memory` mode or a smaller image, and check that nothing else holds the GPU (see [Sharing the GPU](#sharing-the-gpu)).
 - **`model` error at the first run:** the folder is incomplete or not a MOSS-Image folder, or a file is in a format the engine doesn't read. The message names the file and what was found.
+- **"`dit_file` … is a LoRA, not a DiT"** (or another slot and kind): the file is in the wrong ComfyUI folder or picked in the wrong input. Move it, or pick it where it belongs: DiTs in `diffusion_models`, text encoders in `text_encoders`, VAEs in `vae`, LoRAs and control adapters in `loras`.
+- **"LoRA … can't be used: …":** the engine read the file and refuses it, e.g. a LoRA for another model; the rest of the message is the engine's reason.
+- **"control kind '…': … has the kinds …":** set the Control node's `kind` to one of the kinds listed.
+- **"… is not supported by this moss-server (…); it accepts: …":** the node offers a name that this older `moss-server` lacks. Pick one from the list, or update `moss-server`.
 - **Engine log:** `ComfyUI/user/ComfyUI-MossImage-owoinfer/ComfyUI-MossImage-owoinfer.moss-server.log`, with the previous session's log as `.log.1`. Attach it to bug reports.
 
 **Files the pack writes:**
@@ -210,7 +216,6 @@ The engine checks the values itself. When it refuses one, ComfyUI shows its mess
 
 - **Distill bundles** and the `dataspace` sampler: the engine supports them; the pack needs a bundle-folder picker and unset steps / CFG.
 - **Preload** when the model is selected (MossInfer 1.1's `preload`).
-- **Overall progress and time remaining** across the whole run: coded against the `progress_fraction` capability, which no MossInfer release has yet; until then the bar follows the sampling steps.
 - **More loader settings:** VRAM budget and reserve, GPU index, LoRA strictness, text-encoder pinning, certificate folders, DiT read mode.
 - **A model folder of only the small files** (configs and tokenizer) next to single-file models. This needs an engine change.
 
@@ -222,6 +227,8 @@ Run the tests from the pack folder with ComfyUI's Python:
 python -m pytest tests                      # unit and headless-ComfyUI tests with a fake moss-server; no GPU
 OWOINFER_GPU_TESTS=1 python -m pytest tests # adds the GPU smoke tests (MOSS_SERVER=<path to moss-server>)
 ```
+
+With `MOSS_SERVER` set to a MossInfer 1.1 `moss-server`, the plain run also checks the engine's `inspect` answers on the community model files and that every name the nodes offer is one the server accepts; this needs no GPU.
 
 The headless tests start ComfyUI from `COMFYUI_DIR` with a scratch base directory, `--cpu`, their own database and bytecode writing off. A test checks that nothing in the install changed. ComfyUI always reads `<install>/extra_model_paths.yaml` if one exists, so its folders show up in the tests too; the tests warn when it exists.
 
