@@ -8,12 +8,14 @@ import copy
 import json
 import os
 import time
+import warnings
 
 import pytest
 from PIL import Image
 
-from comfy_harness import ComfyUI, comfyui_missing, find, load_workflow_prompt, make_base
-from helpers import make_bundle, make_fake_server, recorded
+from comfy_harness import (ComfyUI, comfyui_missing, find, install_changes, install_extra_paths,
+                           load_workflow_prompt, make_base)
+from helpers import make_bundle, make_fake_server, recorded, write_safetensors
 
 pytestmark = pytest.mark.e2e
 
@@ -34,12 +36,22 @@ def comfy(tmp_path_factory):
         f.write(b"fake")
     os.makedirs(os.path.join(base, "input"), exist_ok=True)
     Image.new("RGB", (96, 64), (10, 200, 30)).save(os.path.join(base, "input", "init.png"))
+    dits = os.path.join(base, "models", "diffusion_models")
+    os.makedirs(dits)
+    write_safetensors(os.path.join(dits, "test_int4.safetensors"), {"layers.0.proj.q.weight": ("I8", [4])},
+                      metadata={"_quantization_metadata": json.dumps(
+                          {"layers": {"layers.0.proj.q": {"format": "convrot_w4a4"}}})})
     yaml = tmp / "extra_model_paths.yaml"
     yaml.write_text(f"owoinfer_e2e:\n  base_path: {tmp / 'extra'}\n  moss_image: bundles\n")
+    if install_extra_paths():
+        warnings.warn(f"ComfyUI also reads {install_extra_paths()}; its folders appear in these tests", stacklevel=2)
     env = dict(os.environ, MOSSINFER_SERVER=make_fake_server(str(tmp / "bin")),
                FAKE_MOSS_RECORD=str(tmp / "requests.jsonl"), FAKE_MOSS_STEP_DELAY="0.02")
-    c = ComfyUI(base, env, extra_args=["--extra-model-paths-config", str(yaml)])
+    marker = tmp / "before-start"
+    marker.write_text("")
+    c = ComfyUI(base, env, extra_args=["--extra-model-paths-config", str(yaml), "--preview-method", "auto"])
     c.env = env
+    c.marker = str(marker)
     try:
         c.wait_ready()
         yield c
@@ -71,7 +83,9 @@ def test_nodes_registered(comfy):
     assert "MOSS-Image-SFT" in options and "Extra-Bundle" in options
     after_run = info["OwoInferMossImageGenerate"]["input"]["required"]["after_run"]
     options = after_run[1]["options"] if after_run[0] == "COMBO" else after_run[0]
-    assert options == ["keep", "unload"]  # the fake 1.0.0 has no `release`
+    assert options == ["keep", "release", "unload"]  # always listed; checked against the server at run time
+    # nothing spawned moss-server at import or schema time
+    assert not os.path.exists(comfy.env["FAKE_MOSS_RECORD"])
 
 
 def test_example_workflow_makes_an_image(comfy):
@@ -126,10 +140,58 @@ def test_after_run_unload(comfy):
     assert [m for m, _ in recorded(comfy.env)].count("load") == loads + 1  # loaded again after the unload
 
 
-def test_after_run_release_is_not_offered(comfy):
-    """The fake 1.0.0 has no `release`: ComfyUI refuses the value before the node runs."""
-    with pytest.raises(RuntimeError, match="after_run"):
-        comfy.queue(small(load_workflow_prompt(comfy), seed=23, after_run="release"))
+def test_after_run_release_needs_the_capability(comfy):
+    entry = comfy.wait_history(comfy.queue(small(load_workflow_prompt(comfy), seed=23, after_run="release")))
+    errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
+    assert "after_run release needs a moss-server with the 'release' capability; this one (1.0.0)" in errors[0]["exception_message"]
+
+
+def loader(prompt, **kw):
+    find(prompt, "OwoInferMossImageModelLoader").update(kw)
+    return prompt
+
+
+def test_int4_dit_with_auto_is_refused_before_running(comfy):
+    prompt = loader(small(load_workflow_prompt(comfy), seed=24), dit_file="test_int4.safetensors", tier="auto")
+    with pytest.raises(RuntimeError) as e:
+        comfy.queue(prompt)
+    assert "INT4 DiT file: choose tier turbo (lossy, uncertified)" in str(e.value)
+    prompt = loader(small(load_workflow_prompt(comfy), seed=24), tier="turbo")  # the folder's bf16 DiT
+    with pytest.raises(RuntimeError, match="tier turbo runs only an INT4 DiT file"):
+        comfy.queue(prompt)
+    prompt = loader(small(load_workflow_prompt(comfy), seed=24), dit_file="nope.safetensors")
+    with pytest.raises(RuntimeError, match="dit_file not found"):  # the combo check validate_inputs repeats
+        comfy.queue(prompt)
+
+
+def test_turbo_with_int4_is_sent_as_chosen(comfy):
+    prompt = loader(small(load_workflow_prompt(comfy), seed=25), dit_file="test_int4.safetensors", tier="turbo")
+    entry = comfy.wait_history(comfy.queue(prompt))
+    assert entry["status"]["status_str"] == "success", entry["status"]
+    load = [p for m, p in recorded(comfy.env) if m == "load"][-1]
+    assert load["tier"] == "turbo" and load["dit_file"].endswith("test_int4.safetensors")
+
+
+def test_replaced_file_runs_again(comfy):
+    """fingerprint_inputs: the same workflow is cached, until a model file is replaced."""
+    prompt = loader(small(load_workflow_prompt(comfy), seed=26), dit_file="test_int4.safetensors", tier="turbo")
+    comfy.wait_history(comfy.queue(prompt))
+    before = recorded(comfy.env)
+    assert comfy.wait_history(comfy.queue(prompt))["status"]["status_str"] == "success"
+    assert recorded(comfy.env) == before  # cached by ComfyUI: nothing sent
+    path = os.path.join(comfy.base, "models", "diffusion_models", "test_int4.safetensors")
+    with open(path, "ab") as f:
+        f.write(b"\0" * 8)  # the file is replaced (another size and mtime)
+    assert comfy.wait_history(comfy.queue(prompt))["status"]["status_str"] == "success"
+    methods = [m for m, _ in recorded(comfy.env)][len(before):]
+    assert methods == ["load", "generate"]  # the loader ran again, and the engine loaded the new file
+
+
+def test_preview_method_none_sends_no_preview(comfy):
+    comfy.wait_history(comfy.queue(small(load_workflow_prompt(comfy), seed=27), extra_data={"preview_method": "none"}))
+    assert "preview_output" not in generate_requests(comfy)[-1]
+    comfy.wait_history(comfy.queue(small(load_workflow_prompt(comfy), seed=28)))
+    assert "preview_output" in generate_requests(comfy)[-1]
 
 
 def test_server_message_shown_as_is(comfy):
@@ -163,3 +225,8 @@ def test_exit_shuts_the_server_down(comfy):
     assert lines[-1] == "shutdown"
     # one long-lived server for every run (plus the one-shot capability probe)
     assert [p for m, p in recorded(comfy.env) if m == "argv"].count(["--parent-pid", str(comfy.proc.pid)]) == 1
+
+
+def test_nothing_written_into_the_install(comfy):
+    comfy.stop()
+    assert install_changes(comfy.marker) == []

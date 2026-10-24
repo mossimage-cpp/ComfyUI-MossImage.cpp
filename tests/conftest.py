@@ -3,6 +3,8 @@ import sys
 
 import pytest
 
+sys.dont_write_bytecode = True  # nothing lands next to the sources (or in an install the tests import)
+
 TESTS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TESTS)
 for p in (ROOT, TESTS):

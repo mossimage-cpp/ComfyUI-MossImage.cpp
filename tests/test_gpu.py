@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from comfy_harness import ComfyUI, comfyui_missing, find, load_workflow_prompt, make_base
+from comfy_harness import ComfyUI, comfyui_missing, find, install_changes, load_workflow_prompt, make_base
 from helpers import COMFY_ORG, GPU_SERVER, LORA_4STEP, MODELS, gpu_skip_reason
 
 pytestmark = pytest.mark.gpu
@@ -37,8 +37,11 @@ def comfy(tmp_path_factory):
         f"owoinfer_gpu:\n  base_path: {MODELS}\n  moss_image: MOSS-Image\n"
         "  diffusion_models: community/comfy-org\n  text_encoders: community/comfy-org\n"
         "  vae: community/comfy-org\n  loras: community/akhaliq/MOSS-Image-SFT-4-steps\n")
+    marker = tmp / "before-start"
+    marker.write_text("")
     c = ComfyUI(base, dict(os.environ, MOSSINFER_SERVER=GPU_SERVER),
-                extra_args=["--extra-model-paths-config", str(yaml)])
+                extra_args=["--extra-model-paths-config", str(yaml), "--preview-method", "auto"])
+    c.marker = str(marker)
     try:
         c.wait_ready()
         yield c
@@ -102,9 +105,14 @@ def test_lora(comfy):
 
 
 def test_after_run_release(comfy):
-    spec = comfy.get("/object_info")["OwoInferMossImageGenerate"]["input"]["required"]["after_run"]
-    options = spec[1]["options"] if spec[0] == "COMBO" else spec[0]
-    if "release" not in options:
+    from owoinfer_comfy.server import ServerManager
+    probe = ServerManager(log_dir=os.path.join(comfy.base, "probe"))
+    try:
+        with probe.session(GPU_SERVER) as s:  # hello only: no engine, no VRAM
+            has_release = s.has("release")
+    finally:
+        probe.shutdown()
+    if not has_release:
         pytest.skip(f"{GPU_SERVER} has no 'release' capability; set MOSS_SERVER to a 1.1 build")
     entry = comfy.wait_history(comfy.queue(workflow(comfy, steps=2, seed=12, after_run="release")), timeout=600)
     assert_ok(entry, comfy)
@@ -134,3 +142,4 @@ def test_exit_stops_the_server(comfy):
     left = subprocess.run(["pgrep", "-f", "-x", f"{GPU_SERVER} --parent-pid {comfy.proc.pid}"],
                           capture_output=True, text=True).stdout.split()
     assert left == [], f"moss-server still running: {left}"
+    assert install_changes(comfy.marker) == []

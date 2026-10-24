@@ -2,7 +2,13 @@
 
 ComfyUI runs from its own code and venv with a scratch --base-directory whose
 custom_nodes/ holds a symlink to this pack, and --cpu so its torch takes no VRAM.
-Nothing is written into the install (bytecode writing is off).
+Nothing is written into the install: bytecode writing is off, and the database
+(by default <install>/user/comfyui.db, whatever --base-directory says) lives in
+the scratch directory. install_changes() checks that.
+
+ComfyUI always reads <install>/extra_model_paths.yaml when that file exists;
+there is no option to skip it. It is only read, but its folders then show up in
+the tests' ComfyUI too. install_extra_paths() names it so a fixture can warn.
 """
 
 import json
@@ -31,6 +37,18 @@ def comfyui_missing() -> str:
     return ""
 
 
+def install_extra_paths() -> str:
+    path = os.path.join(COMFYUI_DIR, "extra_model_paths.yaml")
+    return path if os.path.isfile(path) else ""
+
+
+def install_changes(marker: str) -> list[str]:
+    """Paths in the ComfyUI install newer than `marker`, outside .venv/ and __pycache__/."""
+    out = subprocess.run(["find", COMFYUI_DIR, "-newer", marker, "-not", "-path", "*/.venv/*"],
+                         capture_output=True, text=True).stdout.split("\n")
+    return [p for p in out if p and "__pycache__" not in p]
+
+
 def make_base(base: str) -> str:
     """A scratch base directory with this pack in custom_nodes/."""
     os.makedirs(os.path.join(base, "custom_nodes"), exist_ok=True)
@@ -54,7 +72,8 @@ class ComfyUI:
         self.log_path = log_path or os.path.join(base, "comfyui.log")
         env = dict(env, PYTHONDONTWRITEBYTECODE="1", PYTHONUNBUFFERED="1")
         argv = [COMFYUI_PYTHON, os.path.join(COMFYUI_DIR, "main.py"), "--base-directory", base, "--cpu",
-                "--listen", "127.0.0.1", "--port", str(self.port), "--disable-auto-launch", *extra_args]
+                "--listen", "127.0.0.1", "--port", str(self.port), "--disable-auto-launch",
+                "--database-url", f"sqlite:///{os.path.join(base, 'comfyui.db')}", *extra_args]
         self._log = open(self.log_path, "wb")
         self.proc = subprocess.Popen(argv, cwd=base, env=env, stdout=self._log, stderr=subprocess.STDOUT)
 
@@ -89,8 +108,11 @@ class ComfyUI:
             raise RuntimeError(f"POST {path}: {e.code} {e.read().decode(errors='replace')}") from None
         return json.loads(raw) if raw else None
 
-    def queue(self, prompt) -> str:
-        return self.post("/prompt", {"prompt": prompt, "client_id": "owoinfer-tests"})["prompt_id"]
+    def queue(self, prompt, extra_data=None) -> str:
+        body = {"prompt": prompt, "client_id": "owoinfer-tests"}
+        if extra_data:
+            body["extra_data"] = extra_data
+        return self.post("/prompt", body)["prompt_id"]
 
     def wait_history(self, prompt_id, timeout=600):
         deadline = time.monotonic() + timeout
