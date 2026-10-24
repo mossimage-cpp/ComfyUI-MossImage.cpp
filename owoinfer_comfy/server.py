@@ -18,7 +18,7 @@ import subprocess
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 log = logging.getLogger("owoinfer")
 
@@ -32,7 +32,9 @@ LOG_NAME = "ComfyUI-MossImage-owoinfer.moss-server.log"
 
 REQUEST_TIMEOUT = 120.0  # hello, load, status, cancel, unload: all answer quickly
 SHUTDOWN_TIMEOUT = 5.0  # `shutdown` waits for a running job's cancel, then exits
-CANCEL_SILENCE = 30.0  # after a cancel, this long without any event means the server hangs
+CANCEL_SILENCE = 30.0  # after a cancel, this long without events or `status` answers means the server hangs
+STATUS_EVERY = 5.0  # after a cancel, ask `status` this often while no events come (e.g. during a DiT load)
+CANCEL_LIMIT = 600.0  # after a cancel, the most a job may take to end, however alive the server is
 RELEASE_TIMEOUT = 600.0  # a release reads the DiT into RAM: seconds, at worst minutes
 POLL = 0.1
 
@@ -57,6 +59,14 @@ class ServerNotFound(MossInferError):
 class ServerCrashed(MossInferError):
     def __init__(self, message: str):
         super().__init__("crashed", message)
+
+
+def _adapter_stamp(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
 
 
 def _is_exe(path: str) -> bool:
@@ -398,23 +408,39 @@ class Session:
             self._m._after_error(e)
             raise
 
-    def ensure_loaded(self, load_params: dict[str, Any], stamp: Any = None) -> bool:
+    def ensure_loaded(self, load_params: dict[str, Any], stamp: Any = None, adapters: Iterable[str] = ()) -> bool:
         """`load` unless the engine already runs exactly this config. True if it loaded.
 
         `stamp` (e.g. the model files' sizes and mtimes) is part of the config, so a
         replaced file loads again.
+
+        `adapters` are the LoRA and control adapter files the next job uses. Engines up to
+        1.0 (and no capability says which) key them by path, so one replaced under the same
+        name would keep its old weights: when a path's (mtime, size) differs from the last
+        time it ran on this engine, the engine is unloaded and loaded again first.
         """
+        m = self._m
         key = json.dumps([load_params, stamp], sort_keys=True, default=str)
-        if key == self._m._loaded_key:
+        stamps = {path: _adapter_stamp(path) for path in adapters}
+        stale = [path for path, st in stamps.items() if path in m._adapter_stamps and m._adapter_stamps[path] != st]
+        if key == m._loaded_key and not stale:
+            m._adapter_stamps.update(stamps)
             return False
-        self._m._loaded_key = None  # a failed load leaves no engine
+        if key == m._loaded_key and stale:
+            log.info("moss-server: %s changed on disk; loading the engine again so it reads the new file",
+                     ", ".join(os.path.basename(p) for p in stale))
+            self.unload()
+        m._loaded_key = None  # a failed load leaves no engine
+        m._adapter_stamps = {}
         self.request("load", load_params)
-        self._m._loaded_key = key
+        m._loaded_key = key
+        m._adapter_stamps.update(stamps)
         return True
 
     def unload(self) -> None:
         self.request("unload")
         self._m._loaded_key = None
+        self._m._adapter_stamps = {}
 
     def release(self, keep_host_copy: bool = True, *, should_cancel: Callable[[], bool] | None = None,
                 timeout: float = RELEASE_TIMEOUT) -> dict[str, Any]:
@@ -446,20 +472,27 @@ class Session:
     def run_job(self, method: str, params: dict[str, Any], *,
                 on_event: Callable[[dict[str, Any]], None] | None = None,
                 should_cancel: Callable[[], bool] | None = None,
-                poll: float = POLL, cancel_silence: float = CANCEL_SILENCE) -> dict[str, Any]:
+                poll: float = POLL, cancel_silence: float = CANCEL_SILENCE,
+                status_every: float = STATUS_EVERY, cancel_limit: float = CANCEL_LIMIT) -> dict[str, Any]:
         """Run a `generate` or `preload` and return its `done` event.
 
         Events other than `done` go to `on_event`. When `should_cancel()` turns true,
         or `on_event` raises, a `cancel` goes out and the job is drained to its `done`;
-        an exception from `on_event` is then re-raised. After a cancel, a server that
-        sends nothing for `cancel_silence` seconds is killed.
+        an exception from `on_event` is then re-raised.
+
+        After the cancel, phases without events (a first DiT load, the text encoder) can
+        last a while, so a `status` request goes out every `status_every` seconds of
+        silence, and its answers count as signs of life too. The process is killed when
+        it shows none for `cancel_silence` seconds, or `cancel_limit` seconds after the cancel.
         """
         m = self._m
         proc = m._require_proc()
         job_id = proc.next_id("job")
         events = proc.subscribe(job_id)
         deferred: BaseException | None = None
-        silent_since: float | None = None  # set once the cancel is out
+        cancel_at: float | None = None
+        last_life = 0.0
+        status: tuple[str, queue.Queue] | None = None  # an unanswered `status` request
         try:
             try:
                 proc.request(method, params, req_id=job_id)
@@ -467,26 +500,43 @@ class Session:
                 m._after_error(e)
                 raise
             while True:
-                if silent_since is None and (deferred is not None or (should_cancel is not None and should_cancel())):
+                if cancel_at is None and (deferred is not None or (should_cancel is not None and should_cancel())):
                     try:
                         proc.start_request("cancel", {"id": job_id})  # its answer is not needed
                     except MossInferError as e:
                         m._after_error(e)
                         raise
-                    silent_since = time.monotonic()
+                    cancel_at = last_life = time.monotonic()
                 try:
                     msg = events.get(timeout=poll)
                 except queue.Empty:
-                    if silent_since is not None and time.monotonic() - silent_since > cancel_silence:
+                    if cancel_at is None:
+                        continue
+                    now = time.monotonic()
+                    if status is not None:
+                        try:
+                            answer = status[1].get_nowait()
+                        except queue.Empty:
+                            answer = None
+                        if answer is not None:
+                            status = None
+                            if isinstance(answer, dict) and "result" in answer:
+                                last_life = now
+                    if status is None and now - last_life >= status_every:
+                        try:
+                            status = proc.start_request("status")
+                        except MossInferError:
+                            status = None  # the dead process shows up on `events` as well
+                    if now - last_life > cancel_silence or now - cancel_at > cancel_limit:
                         m._discard_process(kill=True)
                         if deferred is not None:
                             raise deferred from None
                         raise MossInferError(
                             "cancel_timeout",
-                            f"moss-server sent nothing for {cancel_silence:.0f} s after a cancel; it was killed") from None
+                            f"moss-server did not end the job within {now - cancel_at:.0f} s of a cancel; it was killed") from None
                     continue
-                if silent_since is not None:
-                    silent_since = time.monotonic()
+                if cancel_at is not None:
+                    last_life = time.monotonic()
                 if isinstance(msg, _Dead):
                     m._discard_process()
                     if deferred is not None:
@@ -502,6 +552,8 @@ class Session:
                         deferred = e
         finally:
             proc.unsubscribe(job_id)
+            if status is not None:
+                proc.forget(status[0])
         if done.get("status") == "cancelled":
             log.info("moss-server: %s cancelled after %s steps", method, done.get("steps_run"))
         if deferred is not None:
@@ -526,6 +578,7 @@ class ServerManager:
         self._proc: ServerProcess | None = None
         self._hello: dict[str, Any] | None = None
         self._loaded_key: str | None = None
+        self._adapter_stamps: dict[str, tuple[int, int] | None] = {}  # LoRA / control files used on this engine
         self._log_rotated = False
         atexit.register(self.shutdown)
 
@@ -568,14 +621,14 @@ class ServerManager:
         except MossInferError:
             self._discard_process(kill=True)
             raise
-        problem = ""
+        code = problem = ""
         if hello.get("protocol_version") != PROTOCOL_VERSION:
-            problem = f"speaks protocol {hello.get('protocol_version')}, not {PROTOCOL_VERSION}"
+            code, problem = "unsupported_protocol", f"speaks protocol {hello.get('protocol_version')}, not {PROTOCOL_VERSION}"
         elif hello.get("abi_version") != ABI_VERSION:
-            problem = f"has engine ABI {hello.get('abi_version')}, not {ABI_VERSION}"
+            code, problem = "abi_mismatch", f"has engine ABI {hello.get('abi_version')}, not {ABI_VERSION}"
         if problem:
             self._discard_process()
-            raise MossInferError("unsupported_protocol", f"{server_path} {problem}; use a MossInfer 1.x release")
+            raise MossInferError(code, f"{server_path} {problem}; use a MossInfer 1.x release")
         self._hello = hello
         probe = hello.get("probe") or {}
         log.info("moss-server %s started (%s); %s", hello.get("version"), server_path, probe.get("message", ""))
@@ -596,6 +649,7 @@ class ServerManager:
         proc, self._proc = self._proc, None
         self._hello = None
         self._loaded_key = None
+        self._adapter_stamps = {}
         if proc is None:
             return
         if kill:

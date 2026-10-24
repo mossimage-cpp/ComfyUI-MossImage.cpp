@@ -130,7 +130,7 @@ Replacing a model file (same name, new contents) makes the loader run again, and
 
 ### MOSS-Image LoRA: `MOSS_MODEL` → `MOSS_MODEL`
 
-`lora_name` from `models/loras/` and a `strength` (default 1). Chain several; they are applied in order, per generation, so changing them does not reload the model.
+`lora_name` from `models/loras/` and a `strength` (default 1). Chain several; they are applied in order, per generation, so changing them does not reload the model. A LoRA or control adapter file replaced under the same name is the exception: engines up to 1.0 remember them by path, so the pack loads the engine again before the next run, which then reads the new file.
 
 ### MOSS-Image Control → `MOSS_CONTROL`
 

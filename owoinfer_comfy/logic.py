@@ -95,6 +95,8 @@ def find_bundles(roots: Iterable[str], max_depth: int = 3) -> dict[str, str]:
                 continue
             if depth >= max_depth:
                 dirnames[:] = []
+                for c in BUNDLE_PARTS:  # a bundle still downloading here completes in these
+                    seen[os.path.join(dirpath, c)] = _mtime(os.path.join(dirpath, c))
             dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
     found = dict(sorted(found.items()))
     _bundle_cache[(tuple(roots), max_depth)] = (found, seen)
@@ -175,7 +177,7 @@ def dit_quant_kind(path: str) -> str:
                     if isinstance(q, dict):
                         formats.add(str(q.get("format", "")).lower())
             dtypes = {info.get("dtype") for info in header.values() if isinstance(info, dict)}
-    except (OSError, ValueError, TypeError, struct.error):
+    except (OSError, ValueError, TypeError, RecursionError, struct.error):
         return "unknown"
     if any("int4" in f or "w4a4" in f for f in formats):
         return "int4"
@@ -191,17 +193,20 @@ def dit_quant_kind(path: str) -> str:
 
 
 NOT_INT4 = {"int8", "bf16", "fp8", "nvfp4"}
+CERT_SIDECAR = ".mossinfer-cert.json"  # <dit>.mossinfer-cert.json: the DiT's own quality certificate
 
 
-def tier_problem(tier: str, dit_kind: str | None) -> str:
+def tier_problem(tier: str, dit_kind: str | None, has_certificate: bool = False) -> str:
     """Why `tier` cannot run this DiT, or "". The tier itself is always sent unchanged.
 
     `dit_kind` is dit_quant_kind() of the DiT file, None for the folder's own (bf16) DiT.
     Turbo is chosen explicitly and runs only an INT4 DiT; `auto` refuses an uncertified
     INT4 DiT (integration.md, "Model files"). An "unknown" file goes to the engine,
-    which decides.
+    which decides. So does an INT4 file with a sidecar certificate (`has_certificate`):
+    a certificate can let `auto` run it. Certificates in the other places the engine
+    searches (certificate_dirs, the cache folder, the package) are not looked at here.
     """
-    if dit_kind == "int4" and tier == "auto":
+    if dit_kind == "int4" and tier == "auto" and not has_certificate:
         return "INT4 DiT file: choose tier turbo (lossy, uncertified)"
     if tier == "turbo" and (dit_kind is None or dit_kind in NOT_INT4):
         what = "the folder's own DiT (bf16)" if dit_kind is None else f"this DiT file ({dit_kind})"

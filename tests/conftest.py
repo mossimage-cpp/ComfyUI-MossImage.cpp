@@ -3,7 +3,7 @@ import sys
 
 import pytest
 
-sys.dont_write_bytecode = True  # nothing lands next to the sources (or in an install the tests import)
+sys.dont_write_bytecode = True  # no __pycache__ next to the pack's sources from a test run
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TESTS)

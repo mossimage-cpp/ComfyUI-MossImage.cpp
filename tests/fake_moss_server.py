@@ -18,7 +18,9 @@ Prompts with special words:
   CRASH          the process exits with status 134 during denoise
   CUDA_ERROR     done with status error, code cuda
   IGNORE_CANCEL  cancel is acknowledged but the job runs to the end
-  HANG_ON_CANCEL after a cancel the job sends nothing more, ever
+  HANG_ON_CANCEL after a cancel the server hangs: no events, no answers, ever
+  SLOW_CANCEL    after a cancel the job sends nothing for FAKE_MOSS_SLOW_CANCEL seconds
+                 (default 2), while requests are still answered, then ends cancelled
   BAD_LINES      malformed protocol lines before the first step
   WARN           done carries two warnings
 """
@@ -44,6 +46,7 @@ for _c in os.environ.get("FAKE_MOSS_CAPS", DEFAULT_CAPS).split(","):
 VERSION = os.environ.get("FAKE_MOSS_VERSION", "1.0.0")
 PROTOCOL = int(os.environ.get("FAKE_MOSS_PROTOCOL", "1"))
 ABI = int(os.environ.get("FAKE_MOSS_ABI", "1"))
+SLOW_CANCEL = float(os.environ.get("FAKE_MOSS_SLOW_CANCEL", "2"))
 DELAY = float(os.environ.get("FAKE_MOSS_STEP_DELAY", "0.02"))
 RECORD = os.environ.get("FAKE_MOSS_RECORD", "")
 RELEASE_DELAY = float(os.environ.get("FAKE_MOSS_RELEASE_DELAY", "0.02"))
@@ -212,6 +215,8 @@ def run_generate(j, p):
         if "HANG_ON_CANCEL" in prompt and cancel.is_set():
             while True:
                 time.sleep(1)
+        if "SLOW_CANCEL" in prompt and cancel.is_set():
+            time.sleep(SLOW_CANCEL)  # e.g. a DiT load that ends before the cancel is seen
         return honour and cancel.is_set()
 
     def finish_cancelled(steps_run):
@@ -322,10 +327,14 @@ def handle(msg):
             with state_lock:
                 if job is None:
                     return ok({"cancelling": False})
-                if "id" not in p or p["id"] == job["id"]:
-                    job["cancel"].set()
-                    return ok({"cancelling": True, "generating_id": job["id"]})
-                return ok({"cancelling": False, "generating_id": job["id"]})
+                if "id" in p and p["id"] != job["id"]:
+                    return ok({"cancelling": False, "generating_id": job["id"]})
+                job["cancel"].set()
+                ok({"cancelling": True, "generating_id": job["id"]})
+                hang = "HANG_ON_CANCEL" in job.get("prompt", "")
+            while hang:  # the whole server stops: nothing reads stdin any more
+                time.sleep(1)
+            return
         if method == "shutdown":
             with state_lock:
                 j = job
@@ -409,7 +418,8 @@ def handle(msg):
                     return err("busy", "a job is running")
                 if engine is None:
                     return err("no_engine", "no engine is loaded")
-                j = {"id": req_id, "kind": method, "cancel": threading.Event(), "step": 0, "total": p.get("steps", 50)}
+                j = {"id": req_id, "kind": method, "cancel": threading.Event(), "step": 0, "total": p.get("steps", 50),
+                     "prompt": p.get("prompt", "")}
                 job = j
             ok({"accepted": True})
             fn = run_generate if method == "generate" else run_preload

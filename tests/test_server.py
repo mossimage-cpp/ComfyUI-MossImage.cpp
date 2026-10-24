@@ -192,11 +192,36 @@ def test_silent_server_after_cancel_is_killed(manager, fake_server, fake_env, tm
         pid = manager.running.proc.pid
         with pytest.raises(MossInferError) as e:
             s.run_job("generate", gen_params(tmp_path, prompt="HANG_ON_CANCEL", steps=100),
-                      should_cancel=lambda: True, cancel_silence=0.5)
-    assert e.value.code == "cancel_timeout"
+                      should_cancel=lambda: True, cancel_silence=0.5, status_every=0.1)
+    assert e.value.code == "cancel_timeout"  # `status` went unanswered too
     assert manager.running is None
     with manager.session(fake_server) as s:
         assert manager.running.proc.pid != pid
+
+
+def test_status_answers_keep_a_silent_job_alive(manager, fake_server, fake_env, tmp_path):
+    """No events for longer than the silence limit (a DiT load, say), but `status` is answered."""
+    fake_env["FAKE_MOSS_SLOW_CANCEL"] = "1.5"
+    with manager.session(fake_server) as s:
+        load(s, tmp_path)
+        pid = manager.running.proc.pid
+        done = s.run_job("generate", gen_params(tmp_path, prompt="SLOW_CANCEL", steps=100),
+                         should_cancel=lambda: True, cancel_silence=0.6, status_every=0.2)
+        assert done["status"] == "cancelled" and manager.running.proc.pid == pid
+    assert [m for m, _ in recorded(fake_env)].count("status") >= 3
+
+
+def test_cancel_limit(manager, fake_server, fake_env, tmp_path):
+    """However alive the server is, a job that does not end long after its cancel is killed."""
+    fake_env["FAKE_MOSS_SLOW_CANCEL"] = "30"
+    with manager.session(fake_server) as s:
+        load(s, tmp_path)
+        t0 = time.monotonic()
+        with pytest.raises(MossInferError) as e:
+            s.run_job("generate", gen_params(tmp_path, prompt="SLOW_CANCEL", steps=100),
+                      should_cancel=lambda: True, cancel_silence=0.6, status_every=0.2, cancel_limit=1.0)
+    assert e.value.code == "cancel_timeout" and time.monotonic() - t0 < 5
+    assert manager.running is None
 
 
 def test_server_still_talking_after_cancel_is_not_killed(manager, fake_server, fake_env, tmp_path):
@@ -382,13 +407,54 @@ def test_unload_then_load_again(manager, fake_server, fake_env, tmp_path):
     assert [m for m, _ in recorded(fake_env)].count("load") == 2
 
 
-@pytest.mark.parametrize("var,value,word", [("FAKE_MOSS_PROTOCOL", "2", "unsupported protocol"), ("FAKE_MOSS_ABI", "2", "ABI 2")])
-def test_protocol_or_abi_mismatch(tmp_path, fake_server, fake_env, var, value, word):
+def test_replaced_lora_reloads_the_engine(manager, fake_server, fake_env, tmp_path):
+    """Engines up to 1.0 key LoRAs and control adapters by path: a file replaced under the
+    same name needs a new engine (unload, load) before the next generate."""
+    lora = tmp_path / "style.safetensors"
+    adapter = tmp_path / "control.safetensors"
+    lora.write_bytes(b"one")
+    adapter.write_bytes(b"adapter")
+    params = {"model": str(tmp_path / "bundle"), "mode": "balanced"}
+    (tmp_path / "bundle").mkdir()
+
+    def run(s):
+        s.ensure_loaded(params, adapters=[str(lora), str(adapter)])
+        s.run_job("generate", gen_params(tmp_path, loras=[{"path": str(lora), "strength": 1.0}]))
+
+    def methods_since(n):
+        return [m for m, _ in recorded(fake_env)][n:]
+
+    with manager.session(fake_server) as s:
+        run(s)
+        n = len(recorded(fake_env))
+        run(s)  # unchanged: no reload
+        assert methods_since(n) == ["generate"]
+        n = len(recorded(fake_env))
+        lora.write_bytes(b"three")  # replaced under the same name
+        run(s)
+        assert methods_since(n) == ["unload", "load", "generate"]
+        n = len(recorded(fake_env))
+        run(s)  # the new stamp is recorded
+        assert methods_since(n) == ["generate"]
+        n = len(recorded(fake_env))
+        adapter.write_bytes(b"new adapter")
+        run(s)
+        assert methods_since(n) == ["unload", "load", "generate"]
+        # a load for another reason clears the record: nothing stale afterwards
+        assert s.ensure_loaded(dict(params, mode="min_memory"), adapters=[str(lora)]) is True
+        n = len(recorded(fake_env))
+        assert s.ensure_loaded(dict(params, mode="min_memory"), adapters=[str(lora), str(adapter)]) is False
+        assert methods_since(n) == []
+
+
+@pytest.mark.parametrize("var,value,code,word", [("FAKE_MOSS_PROTOCOL", "2", "unsupported_protocol", "unsupported protocol"),
+                                                  ("FAKE_MOSS_ABI", "2", "abi_mismatch", "ABI 2")])
+def test_protocol_or_abi_mismatch(tmp_path, fake_server, fake_env, var, value, code, word):
     m = ServerManager(log_dir=str(tmp_path / "l"), env=dict(fake_env, **{var: value}))
     with pytest.raises(MossInferError) as e:
         with m.session(fake_server):
             pass
-    assert e.value.code == "unsupported_protocol" and word in str(e.value)
+    assert e.value.code == code and word in str(e.value)
     assert m.running is None
 
 

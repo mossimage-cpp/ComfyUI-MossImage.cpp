@@ -105,6 +105,7 @@ def test_dit_quant_kind_malformed_headers(tmp_path):
         "offsets_strings": {"a.comfy_quant": {"dtype": "U8", "shape": [1], "data_offsets": ["0", "4"]}},
         "offsets_backwards": {"a.comfy_quant": {"dtype": "U8", "shape": [1], "data_offsets": [8, 2]}},
         "tensor_not_object": {"w": 5},
+        "deep_qmeta": {"__metadata__": {"_quantization_metadata": "[" * 100000 + "]" * 100000}},
     }
     for name, header in cases.items():
         raw = json.dumps(header).encode()
@@ -130,6 +131,8 @@ def test_tier_problem():
     for kind in ("int8", "bf16", "fp8", "nvfp4"):
         assert f"not this DiT file ({kind})" in logic.tier_problem("turbo", kind)
     assert logic.tier_problem("turbo", "unknown") == ""  # a file the pack cannot read goes to the engine
+    # an INT4 file with its own sidecar certificate: the engine decides what auto runs
+    assert logic.tier_problem("auto", "int4", has_certificate=True) == ""
 
 
 def test_file_and_model_stamps(tmp_path):
@@ -162,6 +165,13 @@ def test_find_bundles_is_cached_until_a_folder_changes(tmp_path, monkeypatch):
     assert list(logic.find_bundles([str(root)])) == ["a", "nested/b"]
     os.remove(root / "a" / "vae" / "config.json")  # a bundle broken inside one of its parts
     assert list(logic.find_bundles([str(root)])) == ["nested/b"]
+    # a bundle at the depth limit that is still downloading: its last config lands in an existing folder
+    deep = root / "x" / "y" / "z"
+    make_bundle(str(deep))
+    os.remove(deep / "vae" / "config.json")
+    assert "x/y/z" not in logic.find_bundles([str(root)])
+    (deep / "vae" / "config.json").write_text("{}")
+    assert "x/y/z" in logic.find_bundles([str(root)])
 
 
 # the model config ---------------------------------------------------------------------------

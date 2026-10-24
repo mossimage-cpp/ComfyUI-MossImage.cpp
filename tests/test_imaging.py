@@ -50,4 +50,15 @@ def test_preview_is_read_in_full(tmp_path):
     Image.new("RGB", (8, 8), (9, 9, 9)).save(tmp_path / "next.png")
     os.replace(tmp_path / "next.png", path)
     assert img.size == (4, 2) and img.getpixel((0, 0)) == (1, 2, 3)
-    assert getattr(img, "fp", None) is None  # no file handle kept
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc/self/fd (Linux) to count open files")
+def test_preview_file_is_closed(tmp_path):
+    """No handle stays open on the preview (on Windows one would make the server's rename fail)."""
+    path = tmp_path / "p.png"
+    Image.new("RGB", (4, 2), (1, 2, 3)).save(path)
+    before = set(os.listdir("/proc/self/fd"))
+    img = load_preview(str(path))
+    after = set(os.listdir("/proc/self/fd"))
+    opened = [os.readlink(f"/proc/self/fd/{fd}") for fd in after - before if os.path.exists(f"/proc/self/fd/{fd}")]
+    assert str(path) not in opened and img.size == (4, 2)

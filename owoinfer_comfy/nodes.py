@@ -108,14 +108,22 @@ class ModelLoader(io.ComfyNode):
         return [FROM_FOLDER] + folder_paths.get_filename_list("diffusion_models")
 
     @classmethod
-    def validate_inputs(cls, dit_file, tier) -> bool | str:
+    def validate_inputs(cls, dit_file=None, tier=None) -> bool | str:
         # ComfyUI skips its own checks for the inputs named here, so they are repeated.
+        # A linked input is None here (its value comes at run time): execute() checks it then.
+        if dit_file is None or tier is None:
+            return True
+        return cls._check(dit_file, tier) or True
+
+    @classmethod
+    def _check(cls, dit_file: str, tier: str) -> str:
         if dit_file not in cls._dit_options():
             return f"dit_file not found in diffusion_models: {dit_file}"
         if tier not in logic.TIERS:
             return f"tier must be one of {', '.join(logic.TIERS)}"
         dit = _file_choice("diffusion_models", dit_file)
-        return logic.tier_problem(tier, logic.dit_quant_kind(dit) if dit else None) or True
+        return logic.tier_problem(tier, logic.dit_quant_kind(dit) if dit else None,
+                                  has_certificate=bool(dit) and os.path.isfile(dit + logic.CERT_SIDECAR))
 
     @classmethod
     def fingerprint_inputs(cls, model_folder, dit_file, text_encoder_file, vae_file, **kwargs):
@@ -127,6 +135,9 @@ class ModelLoader(io.ComfyNode):
     @classmethod
     def execute(cls, model_folder, dit_file, text_encoder_file, vae_file, mode, tier,
                 attention="default") -> io.NodeOutput:
+        problem = cls._check(dit_file, tier)  # again: linked inputs skipped validate_inputs
+        if problem:
+            raise ValueError(problem)
         bundles = _bundles()
         if model_folder not in bundles:
             raise ValueError(f"MOSS-Image folder {model_folder!r} not found in "
@@ -326,7 +337,8 @@ class Generate(io.ComfyNode):
                 params = logic.build_generate_params(
                     values, caps, s.version, output=tmp("out"), preview_output=tmp("preview") if previews else None,
                     init_image=init_path, mask=mask_path, loras=moss_model.loras, control=control_param)
-                s.ensure_loaded(moss_model.load_params(caps, s.version, manager.cache_dir), moss_model.stamp())
+                adapters = [path for path, _ in moss_model.loras] + ([control.adapter] if control is not None else [])
+                s.ensure_loaded(moss_model.load_params(caps, s.version, manager.cache_dir), moss_model.stamp(), adapters)
                 try:
                     done = s.run_job("generate", params, on_event=cls._event_handler(caps, values["steps"], node_id),
                                      should_cancel=mm.processing_interrupted)
@@ -375,7 +387,10 @@ class Generate(io.ComfyNode):
             return
         try:
             if after_run == "release":
-                r = session.release(keep_host_copy=True, should_cancel=mm.processing_interrupted)
+                # After an interrupted run the flag is usually still set: only a new interrupt cancels.
+                was = mm.processing_interrupted()
+                r = session.release(keep_host_copy=True,
+                                    should_cancel=lambda: not was and mm.processing_interrupted())
                 if r.get("cancelled"):
                     log.info("MOSS-Image: release cancelled; the engine keeps its VRAM")
                 else:

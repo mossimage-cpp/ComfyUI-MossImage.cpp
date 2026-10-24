@@ -164,6 +164,21 @@ def test_int4_dit_with_auto_is_refused_before_running(comfy):
         comfy.queue(prompt)
 
 
+def test_linked_tier_is_checked_at_run_time(comfy):
+    """A linked input is None in validate_inputs: the loader checks it when it runs."""
+    prompt = loader(small(load_workflow_prompt(comfy), seed=29), dit_file="test_int4.safetensors")
+    # ComfyUI's If/Else Switch passes any type through, so it can feed a combo input
+    prompt["30"] = {"class_type": "ComfySwitchNode", "inputs": {"switch": True, "on_true": "auto", "on_false": "auto"}}
+    find(prompt, "OwoInferMossImageModelLoader")["tier"] = ["30", 0]
+    entry = comfy.wait_history(comfy.queue(prompt))  # accepted: nothing to check before it runs
+    errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
+    assert errors and errors[0]["node_type"] == "OwoInferMossImageModelLoader"
+    assert "INT4 DiT file: choose tier turbo (lossy, uncertified)" in errors[0]["exception_message"]
+    prompt["30"]["inputs"]["on_true"] = "turbo"
+    entry = comfy.wait_history(comfy.queue(prompt))
+    assert entry["status"]["status_str"] == "success", entry["status"]
+
+
 def test_turbo_with_int4_is_sent_as_chosen(comfy):
     prompt = loader(small(load_workflow_prompt(comfy), seed=25), dit_file="test_int4.safetensors", tier="turbo")
     entry = comfy.wait_history(comfy.queue(prompt))
@@ -223,8 +238,50 @@ def test_exit_shuts_the_server_down(comfy):
     comfy.stop()
     lines = [m for m, _ in recorded(comfy.env)]
     assert lines[-1] == "shutdown"
-    # one long-lived server for every run (plus the one-shot capability probe)
+    # one long-lived server for every run, started by the first one
     assert [p for m, p in recorded(comfy.env) if m == "argv"].count(["--parent-pid", str(comfy.proc.pid)]) == 1
+
+
+@pytest.fixture(scope="module")
+def comfy_release(tmp_path_factory):
+    """A second ComfyUI whose fake moss-server has `release` (MossInfer 1.1)."""
+    tmp = tmp_path_factory.mktemp("e2e-fake-release")
+    base = make_base(str(tmp / "base"))
+    make_bundle(os.path.join(base, "models", "moss_image", "MOSS-Image-SFT"))
+    env = dict(os.environ, MOSSINFER_SERVER=make_fake_server(str(tmp / "bin")),
+               FAKE_MOSS_RECORD=str(tmp / "requests.jsonl"), FAKE_MOSS_STEP_DELAY="0.02",
+               FAKE_MOSS_CAPS="preview,model_files,lora,tiers,samplers,image_input,release", FAKE_MOSS_VERSION="1.1.0",
+               FAKE_MOSS_RELEASE_DELAY="0.5")
+    c = ComfyUI(base, env)
+    c.env = env
+    try:
+        c.wait_ready()
+        yield c
+    finally:
+        c.stop()
+
+
+def test_release_after_an_interrupted_run_is_not_cancelled(comfy_release):
+    """The interrupt that stopped the job is still flagged when after_run releases: only a new one cancels it."""
+    c = comfy_release
+    prompt_id = c.queue(small(load_workflow_prompt(c), steps=400, seed=31, after_run="release"))
+    c.wait_running(prompt_id)
+    time.sleep(1.0)
+    c.post("/interrupt")
+    entry = c.wait_history(prompt_id, timeout=60)
+    assert "execution_interrupted" in [m[0] for m in entry["status"]["messages"]]
+    calls = [(m, p) for m, p in recorded(c.env)]
+    release_at = [i for i, (m, _) in enumerate(calls) if m == "release"]
+    assert release_at, calls
+    assert [m for m, _ in calls[release_at[-1]:]] == ["release"]  # no cancel sent to the release
+    assert "MOSS-Image: released 1.0 GiB of VRAM" in c.log()
+
+
+def test_release_after_a_normal_run(comfy_release):
+    c = comfy_release
+    entry = c.wait_history(c.queue(small(load_workflow_prompt(c), seed=32, after_run="release")))
+    assert entry["status"]["status_str"] == "success"
+    assert [m for m, _ in recorded(c.env)][-2:] == ["generate", "release"]
 
 
 def test_nothing_written_into_the_install(comfy):
