@@ -17,7 +17,8 @@ Environment:
   FAKE_MOSS_VALUES_DROP names left out of them, e.g. "sampler:heun,attention:q8_fp8"
   FAKE_MOSS_INSPECT_MAX inspects that run at once before `busy` (default 2)
   FAKE_MOSS_INSPECT_DELAY seconds an inspect takes (default 0.02; ten times that for a
-                        file whose name contains "slow")
+                        file whose name contains "slow"); a file named "*internal_error*"
+                        gets the error code `internal`
 
 `inspect` (with the capability) answers from the file's safetensors metadata
 "fake_inspect" (a JSON object merged into the result); any other file is "unknown".
@@ -387,6 +388,8 @@ def handle(msg):
                     inspects_running -= 1  # free before answering: the client may send the next one at once
                 if answer is None:
                     return err("io", f"{path}: no such file")
+                if "internal_error" in os.path.basename(path):
+                    return err("internal", "fake: inspect failed inside the engine")
                 ok(answer)
 
             threading.Thread(target=run_inspect, daemon=True).start()

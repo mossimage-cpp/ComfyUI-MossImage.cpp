@@ -37,8 +37,7 @@ STATUS_EVERY = 5.0  # after a cancel, ask `status` this often while no events co
 CANCEL_LIMIT = 600.0  # after a cancel, the most a job may take to end, however alive the server is
 RELEASE_TIMEOUT = 600.0  # a release reads the DiT into RAM: seconds, at worst minutes
 INSPECT_WINDOW = 2  # the server runs at most two `inspect` requests at a time; a third gets `busy`
-INSPECT_BUSY_RETRIES = 100
-INSPECT_TIMEOUT = 120.0  # an inspect reads a file's header (and a LoRA's factor shapes)
+INSPECT_TIMEOUT = 120.0  # per file, `busy` resends included; a DiT's header and scales are about 290 MiB
 POLL = 0.1
 
 
@@ -408,41 +407,59 @@ class Session:
         v = self.hello.get("values")
         return {k: list(x) for k, x in v.items() if isinstance(x, list)} if isinstance(v, dict) else {}
 
-    def inspect(self, paths: Iterable[str]) -> dict[str, dict[str, Any] | MossInferError]:
-        """`inspect` each file: path -> its result, or the MossInferError it got (`io`, `invalid_params`).
+    def inspect(self, paths: Iterable[str], *, should_cancel: Callable[[], bool] | None = None,
+                timeout: float = INSPECT_TIMEOUT) -> dict[str, dict[str, Any] | MossInferError]:
+        """`inspect` each file: path -> its result, or the MossInferError that makes it unusable.
+
+        Only `io` and `invalid_params` answers count as errors. A file left out of the
+        returned dict is unchecked: its inspect timed out (a big DiT on a slow share), the
+        server stayed busy for `timeout`, or it answered another error. A warning is logged
+        and the engine's own checks at load time still apply; inspects run on threads of
+        their own, so a slow one says nothing about the server's health.
 
         Two requests are in flight at a time, the server's limit; one answered `busy`
         anyway is sent again after another answers. Answers are matched by id, in any order.
-        Results are cached per (path, mtime, size), the server's version and build flavour.
+        When `should_cancel()` turns true, what was answered so far is returned at once.
+        Results are cached per file (path, mtime, size), the server binary (path, mtime,
+        size), its version and build flavour.
         """
         if not self.has("inspect"):
             raise MossInferError("not_supported",
                                  f"inspect needs a moss-server with the 'inspect' capability (this one is {self.version})")
         m = self._m
-        build = (self.version, str((self.hello.get("probe") or {}).get("build_flavour", "")))
+        proc = m._require_proc()
+        build = (proc.server_path, _adapter_stamp(proc.server_path), self.version,
+                 str((self.hello.get("probe") or {}).get("build_flavour", "")))
         out: dict[str, dict[str, Any] | MossInferError] = {}
-        todo: list[tuple[str, tuple]] = []
+        todo: list[tuple[str, tuple, float]] = []  # (path, cache key, give up at)
         for path in dict.fromkeys(paths):
             key = (path, _adapter_stamp(path), build)
             if key in m._inspect_cache:
                 out[path] = m._inspect_cache[key]
             else:
-                todo.append((path, key))
-        proc = m._require_proc()
-        waiting: dict[str, tuple[str, tuple, queue.Queue, float]] = {}  # id -> (path, key, slot, deadline)
-        busy: dict[str, int] = {}
+                todo.append((path, key, time.monotonic() + timeout))
+        waiting: dict[str, tuple[str, tuple, queue.Queue, float]] = {}  # id -> (path, key, slot, give up at)
+
+        def unchecked(path: str, why: str) -> None:
+            log.warning("MOSS-Image: %s not checked before the run (%s); the engine checks it when it loads",
+                        os.path.basename(path), why)
+
         try:
             while todo or waiting:
+                if should_cancel is not None and should_cancel():
+                    break
                 while todo and len(waiting) < INSPECT_WINDOW:
-                    path, key = todo.pop(0)
+                    path, key, give_up = todo.pop(0)
                     req_id, slot = proc.start_request("inspect", {"path": path})
-                    waiting[req_id] = (path, key, slot, time.monotonic() + INSPECT_TIMEOUT)
-                for req_id, (path, key, slot, deadline) in list(waiting.items()):
+                    waiting[req_id] = (path, key, slot, give_up)
+                for req_id, (path, key, slot, give_up) in list(waiting.items()):
                     try:
                         msg = slot.get(timeout=POLL / len(waiting))
                     except queue.Empty:
-                        if time.monotonic() > deadline:
-                            raise MossInferError("timeout", f"moss-server did not answer inspect of {path}") from None
+                        if time.monotonic() > give_up:
+                            del waiting[req_id]
+                            proc.forget(req_id)
+                            unchecked(path, f"inspect took over {timeout:.0f} s")
                         continue
                     del waiting[req_id]
                     try:
@@ -451,22 +468,25 @@ class Session:
                         raise
                     except MossInferError as e:
                         if e.code == "busy":  # another client's inspects: sent again once a slot frees
-                            busy[path] = busy.get(path, 0) + 1
-                            if busy[path] > INSPECT_BUSY_RETRIES:
-                                raise MossInferError("busy", f"moss-server stayed busy for inspect of {path}") from None
+                            if time.monotonic() > give_up:
+                                unchecked(path, f"moss-server stayed busy for {timeout:.0f} s")
+                                continue
                             if not waiting:
                                 time.sleep(POLL)
-                            todo.insert(0, (path, key))
-                        else:
+                            todo.insert(0, (path, key, give_up))
+                        elif e.code in ("io", "invalid_params"):
                             out[path] = e
+                        else:
+                            unchecked(path, f"inspect answered {e.code}: {e}")
                         continue
                     m._inspect_cache[key] = result
                     out[path] = result
-        except MossInferError as e:
-            for req_id in waiting:
-                proc.forget(req_id)
+        except ServerCrashed as e:
             m._after_error(e)
             raise
+        finally:
+            for req_id in waiting:
+                proc.forget(req_id)
         return out
 
     def request(self, method: str, params: dict[str, Any] | None = None,

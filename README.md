@@ -228,7 +228,7 @@ python -m pytest tests                      # unit and headless-ComfyUI tests wi
 OWOINFER_GPU_TESTS=1 python -m pytest tests # adds the GPU smoke tests (MOSS_SERVER=<path to moss-server>)
 ```
 
-With `MOSS_SERVER` set to a MossInfer 1.1 `moss-server`, the plain run also checks the engine's `inspect` answers on the community model files and that every name the nodes offer is one the server accepts; this needs no GPU.
+With `MOSS_SERVER` set to a MossInfer 1.1 `moss-server`, the plain run also checks the engine's `inspect` answers on the community model files and that every name the nodes offer is one the server accepts; this needs no GPU. These tests need the model files under `MOSS_MODELS` (default `/workspace/Models`: the MOSS-Image folders and the Comfy-Org, toxicdog and akhaliq files), and without `MOSS_SERVER` they use the GPU tests' default server path (`tests/helpers.py`, `GPU_SERVER`); they skip, saying why, when either is missing or the server has no `inspect`.
 
 The headless tests start ComfyUI from `COMFYUI_DIR` with a scratch base directory, `--cpu`, their own database and bytecode writing off. A test checks that nothing in the install changed. ComfyUI always reads `<install>/extra_model_paths.yaml` if one exists, so its folders show up in the tests too; the tests warn when it exists.
 

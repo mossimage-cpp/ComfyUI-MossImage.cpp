@@ -569,6 +569,7 @@ def test_inspect_results_and_errors(tmp_path, fake_server, inspect_env):
     try:
         with m.session(fake_server) as s:  # no engine needed
             r = s.inspect([dit, lora, other, str(tmp_path / "missing.safetensors"), str(tmp_path / "m")])
+            assert s.request("status")["state"] == "unloaded"
     finally:
         m.shutdown()
     assert r[dit]["kind"] == "dit" and r[dit]["tiers"] == ["auto", "high"] and r[dit]["path"] == dit
@@ -616,6 +617,66 @@ def test_inspect_cap_and_busy(tmp_path, fake_server, inspect_env):
     assert codes == [None, None, "busy"]  # at most two at a time
 
 
+def test_inspect_timeout_skips_the_file(tmp_path, fake_server, inspect_env, caplog):
+    """A slow inspect (a big DiT on a slow share) is not a hung server: the file goes unchecked."""
+    from helpers import LORA, fake_model_file
+    slow = fake_model_file(tmp_path / "slow_dit.safetensors", LORA)
+    fast = fake_model_file(tmp_path / "lora.safetensors", LORA)
+    m = inspect_manager(tmp_path, dict(inspect_env, FAKE_MOSS_INSPECT_DELAY="0.1"))  # slow: 1 s
+    try:
+        with m.session(fake_server) as s:
+            pid = m.running.proc.pid
+            r = s.inspect([slow, fast], timeout=0.4)
+            assert list(r) == [fast]  # the slow one is left out: unchecked
+            assert m.running is not None and m.running.proc.pid == pid
+            assert s.request("status")["state"] == "unloaded"
+    finally:
+        m.shutdown()
+    assert "slow_dit.safetensors not checked before the run (inspect took over 0 s)" in caplog.text
+
+
+def test_inspect_other_errors_leave_the_file_unchecked(tmp_path, fake_server, inspect_env, caplog):
+    from helpers import LORA, fake_model_file
+    odd = fake_model_file(tmp_path / "internal_error.safetensors", LORA)
+    m = inspect_manager(tmp_path, inspect_env)
+    try:
+        with m.session(fake_server) as s:
+            r = s.inspect([odd, str(tmp_path / "missing.safetensors")])
+    finally:
+        m.shutdown()
+    assert odd not in r  # `internal`: unchecked, not a reason to stop the run
+    assert r[str(tmp_path / "missing.safetensors")].code == "io"  # io / invalid_params do count
+    assert "inspect answered internal" in caplog.text
+
+
+def test_inspect_busy_is_bounded_by_time(tmp_path, fake_server, inspect_env, caplog):
+    from helpers import LORA, fake_model_file
+    f = fake_model_file(tmp_path / "lora.safetensors", LORA)
+    m = inspect_manager(tmp_path, dict(inspect_env, FAKE_MOSS_INSPECT_MAX="0"))  # always busy
+    try:
+        with m.session(fake_server) as s:
+            t0 = time.monotonic()
+            assert s.inspect([f], timeout=0.5) == {}
+            assert time.monotonic() - t0 < 3
+    finally:
+        m.shutdown()
+    assert "stayed busy" in caplog.text
+
+
+def test_inspect_returns_early_on_cancel(tmp_path, fake_server, inspect_env):
+    from helpers import LORA, fake_model_file
+    slow = fake_model_file(tmp_path / "slow_lora.safetensors", LORA)
+    m = inspect_manager(tmp_path, dict(inspect_env, FAKE_MOSS_INSPECT_DELAY="0.5"))  # slow: 5 s
+    try:
+        with m.session(fake_server) as s:
+            t0 = time.monotonic()
+            assert s.inspect([slow], should_cancel=lambda: time.monotonic() - t0 > 0.2) == {}
+            assert time.monotonic() - t0 < 2
+            assert s.request("status")["state"] == "unloaded"  # the forgotten answer harms nothing
+    finally:
+        m.shutdown()
+
+
 def test_inspect_resends_after_busy(tmp_path, fake_server, inspect_env):
     """With a server that runs one at a time, the client's second request gets `busy` and goes again."""
     from helpers import LORA, fake_model_file, recorded
@@ -649,9 +710,15 @@ def test_inspect_cache(tmp_path, fake_server, inspect_env):
             fake_model_file(dit, dict(INT8_DIT, tiers=["high"]), tensors={"w": ("BF16", [2]), "x": ("BF16", [2])})
             assert s.inspect([dit, lora])[dit]["tiers"] == ["high"]  # replaced: inspected again
             assert inspected()[2:] == [dit]
-            m._hello = dict(m._hello, version="1.1.1")  # another engine build: nothing cached applies
+            m._hello = dict(m._hello, version="1.1.1")  # another engine version: nothing cached applies
             s.inspect([lora])
             assert inspected()[3:] == [lora]
+            with open(fake_server, "a") as f:
+                f.write("# rebuilt\n")  # the same version, rebuilt: another binary stamp
+            s.inspect([lora])
+            assert inspected()[4:] == [lora]
+            s.inspect([lora])
+            assert inspected()[5:] == []
     finally:
         m.shutdown()
 

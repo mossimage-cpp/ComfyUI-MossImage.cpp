@@ -341,8 +341,10 @@ class Generate(io.ComfyNode):
                 # Before any load: names this server lacks, and files it can't use in their slot.
                 problems = logic.value_problems(s.values, load_params, params, s.version)
                 if s.has("inspect"):
-                    problems += logic.inspected_problems(
-                        moss_model, control, s.inspect(logic.inspect_paths(moss_model, control)))
+                    inspected = s.inspect(logic.inspect_paths(moss_model, control),
+                                          should_cancel=mm.processing_interrupted)
+                    mm.throw_exception_if_processing_interrupted()  # cancelled while inspecting
+                    problems += logic.inspected_problems(moss_model, control, inspected)
                 if problems:
                     raise MossInferError("invalid_params", "\n".join(problems))
                 adapters = [path for path, _ in moss_model.loras] + ([control.adapter] if control is not None else [])

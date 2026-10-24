@@ -8,6 +8,7 @@ the adapter lacks, and a name the server's `values` don't list.
 import copy
 import json
 import os
+import time
 
 import pytest
 from PIL import Image
@@ -45,7 +46,8 @@ def comfy(tmp_path_factory):
                FAKE_MOSS_RECORD=str(tmp / "requests.jsonl"), FAKE_MOSS_STEP_DELAY="0.01",
                FAKE_MOSS_CAPS="preview,model_files,lora,tiers,samplers,image_input,hires,control,accel,release,"
                               "progress_fraction,inspect",
-               FAKE_MOSS_VERSION="1.1.0", FAKE_MOSS_VALUES="1", FAKE_MOSS_VALUES_DROP="sampler:heun")
+               FAKE_MOSS_VERSION="1.1.0", FAKE_MOSS_VALUES="1", FAKE_MOSS_VALUES_DROP="sampler:heun",
+               FAKE_MOSS_INSPECT_DELAY="0.1")  # a file named slow_*: 1 s
     marker = tmp / "before-start"
     marker.write_text("")
     c = ComfyUI(base, env, extra_args=["--preview-method", "auto"])
@@ -143,6 +145,28 @@ def test_name_the_server_lacks(comfy):
     assert msg.rstrip("\n") == ("sampler 'heun' is not supported by this moss-server (1.1.0); it accepts: "
                                 "euler, ab2, euler_ancestral, dpmpp_2m, dpmpp_2m_sde, er_sde, res_multistep, dataspace")
     ok(comfy, workflow(comfy, 13, sampler="euler_ancestral"))
+
+
+def test_unchecked_file_does_not_stop_the_run(comfy):
+    """An inspect error other than io / invalid_params: a warning, and the run goes on."""
+    path = os.path.join(comfy.base, "models", "loras", "internal_error.safetensors")
+    fake_model_file(path, LORA)
+    ok(comfy, with_lora(workflow(comfy, 16), "internal_error.safetensors"))
+    assert "internal_error.safetensors not checked before the run" in comfy.log()
+
+
+def test_interrupt_during_inspect(comfy):
+    path = os.path.join(comfy.base, "models", "loras", "slow_lora.safetensors")
+    fake_model_file(path, LORA)
+    before = methods(comfy)
+    prompt_id = comfy.queue(with_lora(workflow(comfy, 17), "slow_lora.safetensors"))
+    comfy.wait_running(prompt_id)
+    time.sleep(0.3)
+    comfy.post("/interrupt")
+    entry = comfy.wait_history(prompt_id, timeout=30)
+    assert "execution_interrupted" in [m[0] for m in entry["status"]["messages"]]
+    sent = methods(comfy)[len(before):]
+    assert "inspect" in sent and "load" not in sent and "generate" not in sent, sent
 
 
 def test_inspect_results_are_cached(comfy):
