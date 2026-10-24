@@ -1,0 +1,67 @@
+{
+  "last_node_id": 3,
+  "last_link_id": 2,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "OwoInferMossImageModelLoader",
+      "pos": [40, 120],
+      "size": [360, 250],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{"name": "moss_model", "type": "MOSS_MODEL", "links": [1], "slot_index": 0}],
+      "properties": {"Node name for S&R": "OwoInferMossImageModelLoader"},
+      "widgets_values": ["MOSS-Image-SFT", "(from folder)", "(from folder)", "(from folder)", "balanced", "auto", "default", ""]
+    },
+    {
+      "id": 2,
+      "type": "OwoInferMossImageGenerate",
+      "pos": [440, 120],
+      "size": [420, 520],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {"name": "moss_model", "type": "MOSS_MODEL", "link": 1},
+        {"name": "init_image", "type": "IMAGE", "link": null, "shape": 7},
+        {"name": "mask", "type": "MASK", "link": null, "shape": 7},
+        {"name": "control", "type": "MOSS_CONTROL", "link": null, "shape": 7}
+      ],
+      "outputs": [{"name": "image", "type": "IMAGE", "links": [2], "slot_index": 0}],
+      "properties": {"Node name for S&R": "OwoInferMossImageGenerate"},
+      "widgets_values": [
+        "a red fox sitting in a snowy forest at dawn, soft golden light, detailed fur",
+        "",
+        1024, 1024, 50, 3.0, 42, "fixed", "euler", "moss", 5.0,
+        0.75, "crop",
+        "22", "", 0.0, 0.0, 1.0, 4096, 1.0, "official", "philox", 1.0, 1.0,
+        0, 0, 0.45, 0,
+        1.0, "off", 0.0,
+        true, "keep", true
+      ]
+    },
+    {
+      "id": 3,
+      "type": "SaveImage",
+      "pos": [900, 120],
+      "size": [420, 460],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [{"name": "images", "type": "IMAGE", "link": 2}],
+      "outputs": [],
+      "properties": {"Node name for S&R": "SaveImage"},
+      "widgets_values": ["MOSS-Image"]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "MOSS_MODEL"],
+    [2, 2, 0, 3, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}
