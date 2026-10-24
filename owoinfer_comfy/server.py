@@ -36,6 +36,9 @@ CANCEL_SILENCE = 30.0  # after a cancel, this long without events or `status` an
 STATUS_EVERY = 5.0  # after a cancel, ask `status` this often while no events come (e.g. during a DiT load)
 CANCEL_LIMIT = 600.0  # after a cancel, the most a job may take to end, however alive the server is
 RELEASE_TIMEOUT = 600.0  # a release reads the DiT into RAM: seconds, at worst minutes
+INSPECT_WINDOW = 2  # the server runs at most two `inspect` requests at a time; a third gets `busy`
+INSPECT_BUSY_RETRIES = 100
+INSPECT_TIMEOUT = 120.0  # an inspect reads a file's header (and a LoRA's factor shapes)
 POLL = 0.1
 
 
@@ -399,6 +402,73 @@ class Session:
     def has(self, capability: str) -> bool:
         return bool(self.capabilities.get(capability))
 
+    @property
+    def values(self) -> dict[str, list[str]]:
+        """hello's `values`: the names the server accepts per parameter ({} on servers without it)."""
+        v = self.hello.get("values")
+        return {k: list(x) for k, x in v.items() if isinstance(x, list)} if isinstance(v, dict) else {}
+
+    def inspect(self, paths: Iterable[str]) -> dict[str, dict[str, Any] | MossInferError]:
+        """`inspect` each file: path -> its result, or the MossInferError it got (`io`, `invalid_params`).
+
+        Two requests are in flight at a time, the server's limit; one answered `busy`
+        anyway is sent again after another answers. Answers are matched by id, in any order.
+        Results are cached per (path, mtime, size), the server's version and build flavour.
+        """
+        if not self.has("inspect"):
+            raise MossInferError("not_supported",
+                                 f"inspect needs a moss-server with the 'inspect' capability (this one is {self.version})")
+        m = self._m
+        build = (self.version, str((self.hello.get("probe") or {}).get("build_flavour", "")))
+        out: dict[str, dict[str, Any] | MossInferError] = {}
+        todo: list[tuple[str, tuple]] = []
+        for path in dict.fromkeys(paths):
+            key = (path, _adapter_stamp(path), build)
+            if key in m._inspect_cache:
+                out[path] = m._inspect_cache[key]
+            else:
+                todo.append((path, key))
+        proc = m._require_proc()
+        waiting: dict[str, tuple[str, tuple, queue.Queue, float]] = {}  # id -> (path, key, slot, deadline)
+        busy: dict[str, int] = {}
+        try:
+            while todo or waiting:
+                while todo and len(waiting) < INSPECT_WINDOW:
+                    path, key = todo.pop(0)
+                    req_id, slot = proc.start_request("inspect", {"path": path})
+                    waiting[req_id] = (path, key, slot, time.monotonic() + INSPECT_TIMEOUT)
+                for req_id, (path, key, slot, deadline) in list(waiting.items()):
+                    try:
+                        msg = slot.get(timeout=POLL / len(waiting))
+                    except queue.Empty:
+                        if time.monotonic() > deadline:
+                            raise MossInferError("timeout", f"moss-server did not answer inspect of {path}") from None
+                        continue
+                    del waiting[req_id]
+                    try:
+                        result = proc.reply(msg)
+                    except ServerCrashed:
+                        raise
+                    except MossInferError as e:
+                        if e.code == "busy":  # another client's inspects: sent again once a slot frees
+                            busy[path] = busy.get(path, 0) + 1
+                            if busy[path] > INSPECT_BUSY_RETRIES:
+                                raise MossInferError("busy", f"moss-server stayed busy for inspect of {path}") from None
+                            if not waiting:
+                                time.sleep(POLL)
+                            todo.insert(0, (path, key))
+                        else:
+                            out[path] = e
+                        continue
+                    m._inspect_cache[key] = result
+                    out[path] = result
+        except MossInferError as e:
+            for req_id in waiting:
+                proc.forget(req_id)
+            m._after_error(e)
+            raise
+        return out
+
     def request(self, method: str, params: dict[str, Any] | None = None,
                 timeout: float | None = REQUEST_TIMEOUT) -> dict[str, Any]:
         proc = self._m._require_proc()
@@ -579,6 +649,7 @@ class ServerManager:
         self._hello: dict[str, Any] | None = None
         self._loaded_key: str | None = None
         self._adapter_stamps: dict[str, tuple[int, int] | None] = {}  # LoRA / control files used on this engine
+        self._inspect_cache: dict[tuple, dict[str, Any]] = {}  # (path, stamp, (version, flavour)) -> inspect result
         self._log_rotated = False
         atexit.register(self.shutdown)
 

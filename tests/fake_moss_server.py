@@ -13,6 +13,14 @@ Environment:
   FAKE_MOSS_STEP_DELAY  seconds per phase or step (default 0.02)
   FAKE_MOSS_RECORD      a file that gets every request line, and "argv ..." at start
   FAKE_MOSS_RELEASE_DELAY  seconds a release takes (default 0.02)
+  FAKE_MOSS_VALUES      "1": hello carries `values` (the name tables)
+  FAKE_MOSS_VALUES_DROP names left out of them, e.g. "sampler:heun,attention:q8_fp8"
+  FAKE_MOSS_INSPECT_MAX inspects that run at once before `busy` (default 2)
+  FAKE_MOSS_INSPECT_DELAY seconds an inspect takes (default 0.02; ten times that for a
+                        file whose name contains "slow")
+
+`inspect` (with the capability) answers from the file's safetensors metadata
+"fake_inspect" (a JSON object merged into the result); any other file is "unknown".
 
 Prompts with special words:
   CRASH          the process exits with status 134 during denoise
@@ -37,7 +45,7 @@ DEFAULT_CAPS = "preview,model_files,lora,tiers,samplers,image_input,hires,distil
 ALL_CAPS = [
     "preview", "comfyui_models", "model_files", "lora", "tiers", "samplers", "image_input", "hires",
     "distill", "system_cuda", "control", "accel", "preload", "release", "certificate_dirs",
-    "te_host_pin", "progress_fraction",
+    "te_host_pin", "progress_fraction", "inspect",
 ]
 CAPS = {c: False for c in ALL_CAPS}
 for _c in os.environ.get("FAKE_MOSS_CAPS", DEFAULT_CAPS).split(","):
@@ -47,6 +55,22 @@ VERSION = os.environ.get("FAKE_MOSS_VERSION", "1.0.0")
 PROTOCOL = int(os.environ.get("FAKE_MOSS_PROTOCOL", "1"))
 ABI = int(os.environ.get("FAKE_MOSS_ABI", "1"))
 SLOW_CANCEL = float(os.environ.get("FAKE_MOSS_SLOW_CANCEL", "2"))
+INSPECT_MAX = int(os.environ.get("FAKE_MOSS_INSPECT_MAX", "2"))
+INSPECT_DELAY = float(os.environ.get("FAKE_MOSS_INSPECT_DELAY", "0.02"))
+VALUES = {
+    "mode": ["min_memory", "balanced", "max_speed"], "block_path": ["default", "op_by_op", "fused", "fused_graphs"],
+    "tier": ["auto", "reference", "high", "turbo"],
+    "attention": ["default", "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc"],
+    "dit_direct_io": ["auto", "buffered", "direct"], "te_host_pin": ["auto", "on", "off"],
+    "sampler": ["euler", "ab2", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde", "res_multistep", "dataspace"],
+    "scheduler": ["moss", "simple", "normal", "karras", "exponential", "beta", "sgm_uniform"],
+    "noise_layout": ["official", "batch_stream"], "noise_source": ["philox", "philox_device", "brownian_tree"],
+    "resize": ["crop", "fit", "stretch"], "mask_encoding": ["u8", "binary01"], "step_cache": ["off", "fbcache"],
+}
+for _drop in filter(None, os.environ.get("FAKE_MOSS_VALUES_DROP", "").split(",")):
+    _k, _v = _drop.split(":")
+    VALUES[_k].remove(_v)
+inspects_running = 0
 DELAY = float(os.environ.get("FAKE_MOSS_STEP_DELAY", "0.02"))
 RECORD = os.environ.get("FAKE_MOSS_RECORD", "")
 RELEASE_DELAY = float(os.environ.get("FAKE_MOSS_RELEASE_DELAY", "0.02"))
@@ -136,6 +160,28 @@ def write_png(path, width, height, rgb):
     os.replace(tmp, path)
 
 
+def fake_inspect(path):
+    """The file's "fake_inspect" metadata as an inspect result; None when the file is missing."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    result = {"path": path, "kind": "unknown", "loadable": False, "file_bytes": size, "tensors": 0, "note": ""}
+    try:
+        with open(path, "rb") as f:
+            (n,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(n))
+        result["tensors"] = len([k for k in header if k != "__metadata__"])
+        meta = (header.get("__metadata__") or {}).get("fake_inspect")
+        if meta:
+            result.update(json.loads(meta))
+        else:
+            result["note"] = f"{path} is not a MOSS-Image file (fake)"
+    except (ValueError, struct.error, OSError):
+        result["note"] = f"{path} is not a safetensors file"
+    return result
+
+
 def validate_generate(p, need_output=True):
     check_known(p, GEN_PARAMS)
     if need_output and not p.get("output"):
@@ -148,6 +194,8 @@ def validate_generate(p, need_output=True):
             raise ParamError(f'"{k}" must be an integer in [16, 4096]')
         if v <= 0 or v % 16:
             raise ParamError("Height and width must be positive multiples of 16.")
+    if os.environ.get("FAKE_MOSS_VALUES") == "1" and p.get("sampler", "euler") not in VALUES["sampler"]:
+        raise ParamError('"sampler" must be one of ' + ", ".join(VALUES["sampler"]))
     if p.get("sampler", "euler") not in SAMPLERS:
         raise ParamError('"sampler" must be one of ' + ", ".join(sorted(SAMPLERS)))
     if p.get("scheduler", "moss") not in SCHEDULERS:
@@ -309,9 +357,40 @@ def handle(msg):
         if method == "hello":
             if p.get("protocol_version", PROTOCOL) != PROTOCOL:
                 return err("unsupported_protocol", "unsupported protocol version")
-            return ok({"protocol_version": PROTOCOL, "server": "moss-server", "version": VERSION, "abi_version": ABI,
+            hello = {"protocol_version": PROTOCOL, "server": "moss-server", "version": VERSION, "abi_version": ABI,
                        "capabilities": {c: v for c, v in CAPS.items() if v or c in DEFAULT_CAPS.split(",")},
-                       "probe": {"message": "fake probe", "device_count": 1, "supported_device_count": 1}})
+                       "probe": {"message": "fake probe", "device_count": 1, "supported_device_count": 1,
+                                 "build_flavour": "cu13"}}
+            if os.environ.get("FAKE_MOSS_VALUES") == "1":
+                hello["values"] = VALUES
+            return ok(hello)
+        if method == "inspect":
+            if not CAPS["inspect"]:
+                return err("method_not_found", "unknown method: inspect")
+            check_known(p, {None: {"path"}})
+            path = p.get("path")
+            if not isinstance(path, str) or not path:
+                raise ParamError('"path" must be a non-empty string')
+            if os.path.exists(path) and not os.path.isfile(path):
+                raise ParamError(f"{path} is not a regular file")
+            global inspects_running
+            with state_lock:
+                if inspects_running >= INSPECT_MAX:
+                    return err("busy", f"{INSPECT_MAX} inspect requests are running; send it again after one answers")
+                inspects_running += 1
+
+            def run_inspect():
+                global inspects_running
+                time.sleep(INSPECT_DELAY * (10 if "slow" in os.path.basename(path) else 1))
+                answer = fake_inspect(path)
+                with state_lock:
+                    inspects_running -= 1  # free before answering: the client may send the next one at once
+                if answer is None:
+                    return err("io", f"{path}: no such file")
+                ok(answer)
+
+            threading.Thread(target=run_inspect, daemon=True).start()
+            return
         if method == "status":
             with state_lock:
                 r = {"state": "unloaded" if engine is None else "idle"}

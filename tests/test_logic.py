@@ -3,6 +3,7 @@
 import json
 import os
 import struct
+from dataclasses import replace
 
 import pytest
 
@@ -317,3 +318,53 @@ def test_progress_text():
     assert logic.progress_text({"phase": "dit_load", "step": 0, "total_steps": 4}) == "loading DiT"
     assert logic.progress_text({"phase": "denoise", "step": 2, "total_steps": 4, "eta_seconds": 12.4}) == "denoise 2/4 · ETA 12 s"
     assert logic.progress_text({"phase": "denoise", "step": 2, "total_steps": 4, "eta_seconds": None}) == "denoise 2/4"
+
+
+# inspect results and hello values -----------------------------------------------------
+
+def test_inspected_problems():
+    from helpers import CONTROL, INT4_DIT, INT8_DIT, LORA
+    from owoinfer_comfy.server import MossInferError as E
+    m = MossModel("/m", dit_file="/d/int8.safetensors", text_encoder_file="/t/te.safetensors",
+                  vae_file="/v/vae.safetensors", tier="reference").with_lora("/l/a.safetensors", 1)
+    good = {"/d/int8.safetensors": INT8_DIT, "/t/te.safetensors": {"kind": "text_encoder", "loadable": True},
+            "/v/vae.safetensors": {"kind": "vae", "loadable": True}, "/l/a.safetensors": LORA,
+            "/c/control.safetensors": CONTROL}
+    # a non-auto tier not in `tiers`: the server's reason
+    assert logic.inspected_problems(m, None, good) == [
+        "dit_file int8.safetensors: " + INT8_DIT["tier_reasons"]["reference"]]
+    assert logic.inspected_problems(replace(m, tier="high"), None, good) == []
+    # auto is never refused from inspect (no certificates looked up), even for INT4
+    assert logic.inspected_problems(replace(m, tier="auto"), None, dict(good, **{"/d/int8.safetensors": INT4_DIT})) == []
+    # wrong kinds in a slot
+    wrong = dict(good, **{"/d/int8.safetensors": LORA, "/v/vae.safetensors": {"kind": "text_encoder", "loadable": True}})
+    assert logic.inspected_problems(replace(m, tier="high"), None, wrong) == [
+        "dit_file int8.safetensors is a LoRA, not a DiT", "vae_file vae.safetensors is a text encoder, not a VAE"]
+    # LoRAs: not loadable, or not a LoRA
+    bad = dict(good, **{"/l/a.safetensors": dict(LORA, loadable=False, note="a LoRA for SDXL")})
+    assert logic.inspected_problems(replace(m, tier="high"), None, bad) == ["LoRA a.safetensors can't be used: a LoRA for SDXL"]
+    unknown = dict(good, **{"/l/a.safetensors": {"kind": "unknown", "loadable": False, "note": "a GGUF file"}})
+    assert logic.inspected_problems(replace(m, tier="high"), None, unknown) == [
+        "LoRA a.safetensors is not a file the engine can use (a GGUF file), not a LoRA"]
+    # errors from inspect itself
+    assert logic.inspected_problems(replace(m, tier="high"), None,
+                                    dict(good, **{"/t/te.safetensors": E("io", "/t/te.safetensors: no such file")})) == [
+        "text_encoder_file te.safetensors: /t/te.safetensors: no such file"]
+    # control kinds
+    control = MossControl("/c/control.safetensors").with_image(ControlImage("depth", None)).with_image(ControlImage("normal", None))
+    assert logic.inspected_problems(replace(m, tier="high"), control, good) == [
+        "control kind 'normal': control.safetensors has the kinds color, depth"]
+    assert logic.inspected_problems(replace(m, tier="high"), MossControl("/l/a.safetensors"), good) == [
+        "control adapter a.safetensors is a LoRA, not a control adapter"]
+    assert logic.inspect_paths(m, control) == ["/d/int8.safetensors", "/t/te.safetensors", "/v/vae.safetensors",
+                                               "/l/a.safetensors", "/c/control.safetensors"]
+
+
+def test_value_problems():
+    values = {"sampler": ["euler", "ab2"], "attention": ["default", "exact"], "mode": ["balanced"]}
+    load = {"model": "/m", "mode": "balanced", "tier": "auto", "attention": "q8_fp8"}
+    gen = {"sampler": "heun", "scheduler": "karras", "prompt": "p"}
+    assert logic.value_problems(values, load, gen, "1.0.9") == [
+        "attention 'q8_fp8' is not supported by this moss-server (1.0.9); it accepts: default, exact",
+        "sampler 'heun' is not supported by this moss-server (1.0.9); it accepts: euler, ab2"]
+    assert logic.value_problems({}, load, gen, "1.0.0") == []  # no `values`: nothing to check

@@ -98,3 +98,29 @@ def write_safetensors(path, tensors, metadata=None, blobs=None):
     raw = json.dumps(header).encode()
     with open(path, "wb") as f:
         f.write(struct.pack("<Q", len(raw)) + raw + data)
+
+
+def fake_model_file(path, inspect=None, tensors=None, metadata=None):
+    """A small safetensors file that the fake server's `inspect` describes as `inspect`."""
+    meta = dict(metadata or {})
+    if inspect is not None:
+        meta["fake_inspect"] = json.dumps(inspect)
+    os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+    write_safetensors(str(path), tensors or {"w": ("BF16", [2])}, metadata=meta or None)
+    return str(path)
+
+
+INT8_DIT = {"kind": "dit", "loadable": True, "precision": "int8", "quantization": "int8_convrot256",
+            "tiers": ["auto", "high"],
+            "tier_reasons": {"auto": "INT8 ConvRot GEMMs, exact attention, uncertified",
+                             "reference": "tier reference runs bf16 weights exactly, but the loaded DiT or text "
+                                          "encoder file is quantized; load the bundle's bf16 models or use tier high or auto",
+                             "high": "High tier: INT8 ConvRot GEMMs, q8_fp8 attention", "turbo": "the loaded DiT is INT8"}}
+INT4_DIT = {"kind": "dit", "loadable": True, "precision": "w4a4", "quantization": "int4_convrot256", "tiers": ["turbo"],
+            "tier_reasons": {"auto": "no certificate covers it; choose tier turbo to run it uncertified",
+                             "reference": "the loaded DiT is quantized",
+                             "high": "the loaded DiT is INT4 ConvRot, which runs the Turbo tier; use tier turbo",
+                             "turbo": "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention; uncertified"}}
+LORA = {"kind": "lora", "loadable": True, "base_model": "", "adapter_types": ["lora"], "lora_rank": 16,
+        "lora_adapters": 254, "lora_unknown_keys": 0}
+CONTROL = dict(LORA, kind="control_adapter", control_kinds=["color", "depth"], base_model="moss-base")

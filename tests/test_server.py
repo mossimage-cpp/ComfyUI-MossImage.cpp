@@ -546,3 +546,130 @@ def test_progress_fraction_passthrough(tmp_path, fake_server, fake_env):
         m.shutdown()
     fractions = [e["fraction"] for e in seen if e["event"] == "progress"]
     assert fractions == sorted(fractions) and 0 <= fractions[0] and fractions[-1] <= 1
+
+
+# inspect ------------------------------------------------------------------------------
+
+@pytest.fixture
+def inspect_env(fake_env):
+    return dict(fake_env, FAKE_MOSS_CAPS="preview,model_files,lora,tiers,control,inspect", FAKE_MOSS_VERSION="1.1.0",
+                FAKE_MOSS_VALUES="1")
+
+
+def inspect_manager(tmp_path, env):
+    return ServerManager(log_dir=str(tmp_path / "inspect-logs"), env=env)
+
+
+def test_inspect_results_and_errors(tmp_path, fake_server, inspect_env):
+    from helpers import INT8_DIT, LORA, fake_model_file
+    dit = fake_model_file(tmp_path / "m" / "dit.safetensors", INT8_DIT)
+    lora = fake_model_file(tmp_path / "m" / "lora.safetensors", LORA)
+    other = fake_model_file(tmp_path / "m" / "other.safetensors")
+    m = inspect_manager(tmp_path, inspect_env)
+    try:
+        with m.session(fake_server) as s:  # no engine needed
+            r = s.inspect([dit, lora, other, str(tmp_path / "missing.safetensors"), str(tmp_path / "m")])
+    finally:
+        m.shutdown()
+    assert r[dit]["kind"] == "dit" and r[dit]["tiers"] == ["auto", "high"] and r[dit]["path"] == dit
+    assert r[lora]["kind"] == "lora" and r[lora]["lora_rank"] == 16
+    assert r[other]["kind"] == "unknown" and r[other]["loadable"] is False
+    assert isinstance(r[str(tmp_path / "missing.safetensors")], MossInferError)
+    assert r[str(tmp_path / "missing.safetensors")].code == "io"
+    assert r[str(tmp_path / "m")].code == "invalid_params"
+
+
+def test_inspect_answers_out_of_order(tmp_path, fake_server, inspect_env):
+    """A slow inspect is answered after a later fast one; matching by id gets both right."""
+    from helpers import INT8_DIT, LORA, fake_model_file
+    slow = fake_model_file(tmp_path / "slow_dit.safetensors", INT8_DIT)
+    fast = fake_model_file(tmp_path / "lora.safetensors", LORA)
+    m = inspect_manager(tmp_path, dict(inspect_env, FAKE_MOSS_INSPECT_DELAY="0.05"))
+    try:
+        with m.session(fake_server) as s:
+            proc = m.running
+            _, slow_slot = proc.start_request("inspect", {"path": slow})
+            _, fast_slot = proc.start_request("inspect", {"path": fast})
+            assert proc.reply(fast_slot.get(timeout=5))["kind"] == "lora"
+            assert slow_slot.empty()  # still running: answered later
+            assert proc.reply(slow_slot.get(timeout=5))["kind"] == "dit"
+            status = s.request("status")  # a request sent during a slow inspect is answered first
+            assert status["state"] in ("unloaded", "idle")
+            r = s.inspect([slow, fast])
+            assert r[slow]["kind"] == "dit" and r[fast]["kind"] == "lora"
+    finally:
+        m.shutdown()
+
+
+def test_inspect_cap_and_busy(tmp_path, fake_server, inspect_env):
+    from helpers import LORA, fake_model_file
+    files = [fake_model_file(tmp_path / f"l{i}.safetensors", LORA) for i in range(3)]
+    m = inspect_manager(tmp_path, dict(inspect_env, FAKE_MOSS_INSPECT_DELAY="0.3"))
+    try:
+        with m.session(fake_server):
+            proc = m.running
+            slots = [proc.start_request("inspect", {"path": f})[1] for f in files]
+            answers = [s.get(timeout=5) for s in slots]
+    finally:
+        m.shutdown()
+    codes = [(a.get("error") or {}).get("code") for a in answers]
+    assert codes == [None, None, "busy"]  # at most two at a time
+
+
+def test_inspect_resends_after_busy(tmp_path, fake_server, inspect_env):
+    """With a server that runs one at a time, the client's second request gets `busy` and goes again."""
+    from helpers import LORA, fake_model_file, recorded
+    files = [fake_model_file(tmp_path / f"l{i}.safetensors", LORA) for i in range(4)]
+    env = dict(inspect_env, FAKE_MOSS_INSPECT_MAX="1", FAKE_MOSS_INSPECT_DELAY="0.05")
+    m = inspect_manager(tmp_path, env)
+    try:
+        with m.session(fake_server) as s:
+            r = s.inspect(files)
+    finally:
+        m.shutdown()
+    assert all(r[f]["kind"] == "lora" for f in files)
+    assert [meth for meth, _ in recorded(env)].count("inspect") > len(files)
+
+
+def test_inspect_cache(tmp_path, fake_server, inspect_env):
+    from helpers import INT8_DIT, LORA, fake_model_file, recorded
+    dit = fake_model_file(tmp_path / "dit.safetensors", INT8_DIT)
+    lora = fake_model_file(tmp_path / "lora.safetensors", LORA)
+    m = inspect_manager(tmp_path, inspect_env)
+
+    def inspected():
+        return [p["path"] for meth, p in recorded(inspect_env) if meth == "inspect"]
+
+    try:
+        with m.session(fake_server) as s:
+            s.inspect([dit, lora])
+            assert sorted(inspected()) == sorted([dit, lora])
+            s.inspect([dit, lora])
+            assert len(inspected()) == 2  # both cached
+            fake_model_file(dit, dict(INT8_DIT, tiers=["high"]), tensors={"w": ("BF16", [2]), "x": ("BF16", [2])})
+            assert s.inspect([dit, lora])[dit]["tiers"] == ["high"]  # replaced: inspected again
+            assert inspected()[2:] == [dit]
+            m._hello = dict(m._hello, version="1.1.1")  # another engine build: nothing cached applies
+            s.inspect([lora])
+            assert inspected()[3:] == [lora]
+    finally:
+        m.shutdown()
+
+
+def test_inspect_needs_the_capability(manager, fake_server, tmp_path):
+    with manager.session(fake_server) as s:
+        with pytest.raises(MossInferError) as e:
+            s.inspect([str(tmp_path / "x")])
+    assert e.value.code == "not_supported" and "'inspect'" in str(e.value)
+
+
+def test_hello_values(tmp_path, fake_server, inspect_env, manager):
+    m = inspect_manager(tmp_path, dict(inspect_env, FAKE_MOSS_VALUES_DROP="sampler:heun"))
+    try:
+        with m.session(fake_server) as s:
+            assert "heun" not in s.values["sampler"] and "euler" in s.values["sampler"]
+            assert s.values["attention"][0] == "default"
+    finally:
+        m.shutdown()
+    with manager.session(fake_server) as s:
+        assert s.values == {}  # a server without `values`

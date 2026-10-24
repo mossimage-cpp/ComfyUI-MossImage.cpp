@@ -406,3 +406,93 @@ def progress_text(event: dict[str, Any]) -> str:
     if isinstance(eta, (int, float)) and eta >= 0:
         text += f" · ETA {eta:.0f} s"
     return text
+
+
+# what the server says about files (`inspect`) and names (hello's `values`) ----------------
+
+KIND_NAMES = {"dit": "a DiT", "text_encoder": "a text encoder", "vae": "a VAE", "lora": "a LoRA",
+              "control_adapter": "a control adapter", "unknown": "not a file the engine can use"}
+
+
+def _what(result: dict[str, Any]) -> str:
+    kind = str(result.get("kind", "unknown"))
+    text = KIND_NAMES.get(kind, kind)
+    note = str(result.get("note") or "")
+    return f"{text} ({note})" if note else text
+
+
+def inspected_problems(model: "MossModel", control: "MossControl | None",
+                       results: dict[str, Any]) -> list[str]:
+    """Why the files of a run can't work, from the server's `inspect` results ([] when they can).
+
+    `results` maps each path to its result dict, or to the MossInferError its inspect got.
+    A non-auto tier must be in the DiT's `tiers`. `auto` is never refused from here: inspect
+    looks up no certificates, so a certified GPU and package may run what it calls refused.
+    """
+    problems: list[str] = []
+
+    def check(slot: str, path: str, kind: str) -> dict[str, Any] | None:
+        r = results.get(path)
+        name = os.path.basename(path)
+        if isinstance(r, Exception):
+            problems.append(f"{slot} {name}: {r}")
+            return None
+        if r is None:
+            return None
+        if r.get("kind") != kind:
+            problems.append(f"{slot} {name} is {_what(r)}, not {KIND_NAMES[kind]}")
+            return None
+        if not r.get("loadable", False):
+            problems.append(f"{slot} {name} can't be used: {r.get('note') or 'the engine refuses it'}")
+            return None
+        return r
+
+    if model.dit_file:
+        dit = check("dit_file", model.dit_file, "dit")
+        if dit is not None and model.tier != "auto" and model.tier not in (dit.get("tiers") or []):
+            reason = (dit.get("tier_reasons") or {}).get(model.tier) or f"tier {model.tier} does not run this DiT"
+            problems.append(f"dit_file {os.path.basename(model.dit_file)}: {reason}")
+    if model.text_encoder_file:
+        check("text_encoder_file", model.text_encoder_file, "text_encoder")
+    if model.vae_file:
+        check("vae_file", model.vae_file, "vae")
+    for path, _ in model.loras:
+        check("LoRA", path, "lora")
+    if control is not None:
+        adapter = check("control adapter", control.adapter, "control_adapter")
+        if adapter is not None:
+            kinds = list(adapter.get("control_kinds") or [])
+            for image in control.images:
+                if image.kind not in kinds:
+                    problems.append(f"control kind {image.kind!r}: {os.path.basename(control.adapter)} has the kinds "
+                                    f"{', '.join(kinds) or '(none)'}")
+    return problems
+
+
+def inspect_paths(model: "MossModel", control: "MossControl | None") -> list[str]:
+    paths = [p for p in (model.dit_file, model.text_encoder_file, model.vae_file) if p]
+    paths += [p for p, _ in model.loras]
+    if control is not None:
+        paths.append(control.adapter)
+    return list(dict.fromkeys(paths))
+
+
+# load / generate params checked against hello's `values`, under the same names
+VALUE_CHECKS = {"load": ("mode", "tier", "attention"),
+                "generate": ("sampler", "scheduler", "resize", "step_cache", "noise_layout", "noise_source")}
+
+
+def value_problems(values: dict[str, list[str]], load_params: dict[str, Any],
+                   generate_params: dict[str, Any], version: str) -> list[str]:
+    """Names this server does not accept, from hello's `values` ([] when it has no `values`).
+
+    The node's lists are fixed when ComfyUI defines it; an older server may lack a name.
+    """
+    problems = []
+    for params, names in ((load_params, VALUE_CHECKS["load"]), (generate_params, VALUE_CHECKS["generate"])):
+        for name in names:
+            accepted = values.get(name)
+            if accepted is not None and name in params and params[name] not in accepted:
+                problems.append(f"{name} {params[name]!r} is not supported by this moss-server ({version}); "
+                                f"it accepts: {', '.join(accepted)}")
+    return problems

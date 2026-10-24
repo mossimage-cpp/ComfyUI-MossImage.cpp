@@ -337,8 +337,16 @@ class Generate(io.ComfyNode):
                 params = logic.build_generate_params(
                     values, caps, s.version, output=tmp("out"), preview_output=tmp("preview") if previews else None,
                     init_image=init_path, mask=mask_path, loras=moss_model.loras, control=control_param)
+                load_params = moss_model.load_params(caps, s.version, manager.cache_dir)
+                # Before any load: names this server lacks, and files it can't use in their slot.
+                problems = logic.value_problems(s.values, load_params, params, s.version)
+                if s.has("inspect"):
+                    problems += logic.inspected_problems(
+                        moss_model, control, s.inspect(logic.inspect_paths(moss_model, control)))
+                if problems:
+                    raise MossInferError("invalid_params", "\n".join(problems))
                 adapters = [path for path, _ in moss_model.loras] + ([control.adapter] if control is not None else [])
-                s.ensure_loaded(moss_model.load_params(caps, s.version, manager.cache_dir), moss_model.stamp(), adapters)
+                s.ensure_loaded(load_params, moss_model.stamp(), adapters)
                 try:
                     done = s.run_job("generate", params, on_event=cls._event_handler(caps, values["steps"], node_id),
                                      should_cancel=mm.processing_interrupted)
