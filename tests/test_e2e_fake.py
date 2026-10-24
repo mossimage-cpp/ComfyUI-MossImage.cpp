@@ -238,6 +238,7 @@ def test_exit_shuts_the_server_down(comfy):
     comfy.stop()
     lines = [m for m, _ in recorded(comfy.env)]
     assert lines[-1] == "shutdown"
+    assert "inspect" not in lines  # a server without the capability: the header checks only
     # one long-lived server for every run, started by the first one
     assert [p for m, p in recorded(comfy.env) if m == "argv"].count(["--parent-pid", str(comfy.proc.pid)]) == 1
 

@@ -86,8 +86,13 @@ def test_previews_and_progress(manager):
     phases = [e["phase"] for e in events if e["event"] == "progress"]
     assert phases[0] == "text_encoder" and phases[-1] == "decode" and phases.count("denoise") == 4
     mapper = logic.ProgressMapper(s.has("progress_fraction"), 3)
-    positions = [mapper.update(e) for e in events if e["event"] == "progress"]
-    assert [x for x in positions if x][-1][0] == mapper.total
+    positions = [x for x in (mapper.update(e) for e in events if e["event"] == "progress") if x]
+    if s.has("progress_fraction"):  # the whole job's share: never decreasing, below 1 until done
+        values = [v for v, _ in positions]
+        assert values == sorted(values) and values[-1] < mapper.total and values[-1] > mapper.total // 2
+        assert all(e["eta_seconds"] is None or e["eta_seconds"] >= 0 for e in events if e["event"] == "progress")
+    else:
+        assert positions[-1][0] == mapper.total
 
 
 def test_killed_server_is_restarted(manager):
