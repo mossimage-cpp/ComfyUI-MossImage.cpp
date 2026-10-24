@@ -67,30 +67,76 @@ def find_bundles(roots: Iterable[str], max_depth: int = 3) -> dict[str, str]:
     """Bundle folders under `roots`, named by their path relative to the root ("/" separated).
 
     A bundle's own subfolders are not searched; the first root wins on a name clash.
+    The result is cached until a folder that the search looked at changes (its mtime),
+    because ComfyUI asks for the node schemas often.
     """
+    roots = list(roots)
+    cached = _bundle_cache.get((tuple(roots), max_depth))
+    if cached is not None and all(_mtime(d) == t for d, t in cached[1].items()):
+        return dict(cached[0])
     found: dict[str, str] = {}
+    seen: dict[str, int | None] = {}
     for root in roots:
+        seen[root] = _mtime(root)
         if not os.path.isdir(root):
             continue
         if is_bundle_dir(root):  # a path that names one bundle directly
             found.setdefault(os.path.basename(os.path.normpath(root)), root)
             continue
         for dirpath, dirnames, _ in os.walk(root, followlinks=True):
+            seen[dirpath] = _mtime(dirpath)
             rel = os.path.relpath(dirpath, root)
             depth = 0 if rel == "." else rel.count(os.sep) + 1
             if depth and is_bundle_dir(dirpath):
                 found.setdefault(rel.replace(os.sep, "/"), dirpath)
+                for c in BUNDLE_PARTS:  # a part removed or re-made changes these
+                    seen[os.path.join(dirpath, c)] = _mtime(os.path.join(dirpath, c))
                 dirnames[:] = []
                 continue
             if depth >= max_depth:
                 dirnames[:] = []
             dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-    return dict(sorted(found.items()))
+    found = dict(sorted(found.items()))
+    _bundle_cache[(tuple(roots), max_depth)] = (found, seen)
+    return dict(found)
+
+
+BUNDLE_PARTS = ("tokenizer", "transformer", "text_encoder", "vae")
+_bundle_cache: dict[tuple, tuple[dict[str, str], dict[str, int | None]]] = {}
+
+
+def _mtime(path: str) -> int | None:
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+def file_stamp(path: str) -> tuple[str, int, int] | None:
+    """(path, mtime in ns, size): changes when the file is replaced. None when missing."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return path, st.st_mtime_ns, st.st_size
+
+
+def bundle_stamp(model_dir: str) -> list:
+    """file_stamp() of every file in the bundle's tokenizer/ and component folders."""
+    out = []
+    for part in BUNDLE_PARTS:
+        folder = os.path.join(model_dir, part)
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        out += [file_stamp(os.path.join(folder, n)) for n in names]
+    return out
 
 
 # DiT files -------------------------------------------------------------------------------
 
-MAX_HEADER_BYTES = 100 * 1024 * 1024
+MAX_HEADER_BYTES = 16 * 1024 * 1024  # real DiT headers are about 100 KB
 
 
 def dit_quant_kind(path: str) -> str:
@@ -105,20 +151,31 @@ def dit_quant_kind(path: str) -> str:
             if n > MAX_HEADER_BYTES:
                 return "unknown"
             header = json.loads(f.read(n))
+            if not isinstance(header, dict):
+                return "unknown"
             formats: set[str] = set()
-            meta = header.pop("__metadata__", None) or {}
-            qmeta = meta.get("_quantization_metadata")
-            if qmeta:
-                for layer in (json.loads(qmeta).get("layers") or {}).values():
-                    formats.add(str(layer.get("format", "")).lower())
+            meta = header.pop("__metadata__", None)
+            qmeta = meta.get("_quantization_metadata") if isinstance(meta, dict) else None
+            if isinstance(qmeta, str):
+                layers = json.loads(qmeta)
+                layers = layers.get("layers") if isinstance(layers, dict) else None
+                for layer in (layers.values() if isinstance(layers, dict) else ()):
+                    if isinstance(layer, dict):
+                        formats.add(str(layer.get("format", "")).lower())
             for name, info in header.items():
-                if name.endswith(".comfy_quant") and info.get("dtype") == "U8":
-                    start, end = info["data_offsets"]
-                    if end - start <= 4096:
-                        f.seek(8 + n + start)
-                        formats.add(str(json.loads(f.read(end - start)).get("format", "")).lower())
+                if not (name.endswith(".comfy_quant") and isinstance(info, dict) and info.get("dtype") == "U8"):
+                    continue
+                offsets = info.get("data_offsets")
+                if not (isinstance(offsets, list) and len(offsets) == 2 and all(isinstance(o, int) for o in offsets)):
+                    continue
+                start, end = offsets
+                if 0 <= start <= end and end - start <= 4096:
+                    f.seek(8 + n + start)
+                    q = json.loads(f.read(end - start))
+                    if isinstance(q, dict):
+                        formats.add(str(q.get("format", "")).lower())
             dtypes = {info.get("dtype") for info in header.values() if isinstance(info, dict)}
-    except (OSError, ValueError, KeyError, struct.error, AttributeError):
+    except (OSError, ValueError, TypeError, struct.error):
         return "unknown"
     if any("int4" in f or "w4a4" in f for f in formats):
         return "int4"
@@ -133,25 +190,23 @@ def dit_quant_kind(path: str) -> str:
     return "unknown"
 
 
-def resolve_tier(tier: str, dit_kind: str | None) -> tuple[str, str]:
-    """The tier to send, and a note for the log ("" when the tier is as chosen).
+NOT_INT4 = {"int8", "bf16", "fp8", "nvfp4"}
 
-    `dit_kind` is dit_quant_kind() of the DiT file, None for the folder's own DiT.
-    An INT4 DiT runs only under `turbo`, and `turbo` runs only an INT4 DiT
-    (integration.md, "Model files"); `auto` refuses an uncertified INT4 DiT, so it
-    becomes `turbo` for one.
+
+def tier_problem(tier: str, dit_kind: str | None) -> str:
+    """Why `tier` cannot run this DiT, or "". The tier itself is always sent unchanged.
+
+    `dit_kind` is dit_quant_kind() of the DiT file, None for the folder's own (bf16) DiT.
+    Turbo is chosen explicitly and runs only an INT4 DiT; `auto` refuses an uncertified
+    INT4 DiT (integration.md, "Model files"). An "unknown" file goes to the engine,
+    which decides.
     """
-    if tier not in TIERS:
-        raise ValueError(f"tier must be one of {', '.join(TIERS)}")
-    if dit_kind == "int4":
-        if tier == "auto":
-            return "turbo", "INT4 DiT file: tier auto runs it as turbo"
-        if tier != "turbo":
-            raise ValueError(f"an INT4 DiT file runs only under tier turbo, not {tier}")
-    elif tier == "turbo":
-        what = "the folder's own DiT" if dit_kind is None else f"this DiT file ({dit_kind})"
-        raise ValueError(f"tier turbo runs only an INT4 DiT file, not {what}")
-    return tier, ""
+    if dit_kind == "int4" and tier == "auto":
+        return "INT4 DiT file: choose tier turbo (lossy, uncertified)"
+    if tier == "turbo" and (dit_kind is None or dit_kind in NOT_INT4):
+        what = "the folder's own DiT (bf16)" if dit_kind is None else f"this DiT file ({dit_kind})"
+        return f"tier turbo runs only an INT4 DiT file, not {what}"
+    return ""
 
 
 # the model config ----------------------------------------------------------------------
@@ -167,11 +222,15 @@ class MossModel:
     mode: str = "balanced"
     tier: str = "auto"
     attention: str = "default"
-    server_path: str = ""  # "" = locate it (MOSSINFER_SERVER, the pack's bin/, PATH)
     loras: tuple[tuple[str, float], ...] = ()
 
     def with_lora(self, path: str, strength: float) -> "MossModel":
         return replace(self, loras=self.loras + ((path, float(strength)),))
+
+    def stamp(self) -> list:
+        """The files' sizes and mtimes, so a replaced file makes the engine load again."""
+        return bundle_stamp(self.model_dir) + [file_stamp(f) for f in
+                                               (self.dit_file, self.text_encoder_file, self.vae_file) if f]
 
     def load_params(self, caps: dict[str, bool], version: str, cache_dir: str | None = None) -> dict[str, Any]:
         p: dict[str, Any] = {"model": self.model_dir, "mode": self.mode}

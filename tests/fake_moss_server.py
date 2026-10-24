@@ -9,13 +9,17 @@ Environment:
   FAKE_MOSS_CAPS        comma-separated capabilities that are true (default: a 1.0.0 build)
   FAKE_MOSS_VERSION     the version in hello (default 1.0.0)
   FAKE_MOSS_PROTOCOL    the protocol_version in hello (default 1)
+  FAKE_MOSS_ABI         the abi_version in hello (default 1)
   FAKE_MOSS_STEP_DELAY  seconds per phase or step (default 0.02)
   FAKE_MOSS_RECORD      a file that gets every request line, and "argv ..." at start
+  FAKE_MOSS_RELEASE_DELAY  seconds a release takes (default 0.02)
 
 Prompts with special words:
   CRASH          the process exits with status 134 during denoise
   CUDA_ERROR     done with status error, code cuda
   IGNORE_CANCEL  cancel is acknowledged but the job runs to the end
+  HANG_ON_CANCEL after a cancel the job sends nothing more, ever
+  BAD_LINES      malformed protocol lines before the first step
   WARN           done carries two warnings
 """
 
@@ -39,8 +43,10 @@ for _c in os.environ.get("FAKE_MOSS_CAPS", DEFAULT_CAPS).split(","):
         CAPS[_c.strip()] = True
 VERSION = os.environ.get("FAKE_MOSS_VERSION", "1.0.0")
 PROTOCOL = int(os.environ.get("FAKE_MOSS_PROTOCOL", "1"))
+ABI = int(os.environ.get("FAKE_MOSS_ABI", "1"))
 DELAY = float(os.environ.get("FAKE_MOSS_STEP_DELAY", "0.02"))
 RECORD = os.environ.get("FAKE_MOSS_RECORD", "")
+RELEASE_DELAY = float(os.environ.get("FAKE_MOSS_RELEASE_DELAY", "0.02"))
 
 LOAD_PARAMS = {
     None: {"model", "mode", "device", "vram_budget_bytes", "vram_reserve_bytes", "host_ram_budget_bytes",
@@ -180,6 +186,15 @@ def progress(job_id, phase, step, total, elapsed, fraction):
     send(ev)
 
 
+def finish(j, msg):
+    """The server is idle again by the time `done` is written (server-protocol.md)."""
+    global job
+    with state_lock:
+        if job is j:
+            job = None
+    send(msg)
+
+
 def run_generate(j, p):
     prompt = p.get("prompt", "")
     total = p.get("steps", 50)
@@ -194,10 +209,13 @@ def run_generate(j, p):
         return round(time.monotonic() - t0, 4)
 
     def cancelled():
+        if "HANG_ON_CANCEL" in prompt and cancel.is_set():
+            while True:
+                time.sleep(1)
         return honour and cancel.is_set()
 
     def finish_cancelled(steps_run):
-        send({"event": "done", "id": j["id"], "status": "cancelled", "steps_run": steps_run,
+        finish(j, {"event": "done", "id": j["id"], "status": "cancelled", "steps_run": steps_run,
               "report": {"cancelled": True, "steps_run": steps_run}, "certified": True, "warnings": []})
 
     send({"event": "plan", "id": j["id"], "explanation": "fake plan", "plan": {"mode": engine.get("mode", "balanced")}})
@@ -209,6 +227,10 @@ def run_generate(j, p):
         if cancelled():
             return finish_cancelled(0)
     j["phase"] = "denoise"
+    if "BAD_LINES" in prompt:
+        with out_lock:
+            sys.stdout.write('not json\n[1, 2]\n{"id": "x", "error": "a string"}\n{"event": "progress"}\n')
+            sys.stdout.flush()
     progress(j["id"], "denoise", 0, total, elapsed(), 2 / units)
     for step in range(1, total + 1):
         time.sleep(DELAY)
@@ -228,7 +250,7 @@ def run_generate(j, p):
     progress(j["id"], "decode", 0, total, elapsed(), (2 + total) / units)
     time.sleep(DELAY)
     if "CUDA_ERROR" in prompt:
-        send({"event": "done", "id": j["id"], "status": "error",
+        finish(j, {"event": "done", "id": j["id"], "status": "error",
               "error": {"code": "cuda", "message": "CUDA error: an illegal memory access was encountered"}, "warnings": []})
         return
     seed = p.get("seed", 42)
@@ -238,7 +260,7 @@ def run_generate(j, p):
     warnings = ["LoRA layers.0.proj.q: requantized", "prompt truncated to 1 of 2 tokens"] if "WARN" in prompt else []
     report = {"request": p, "seed_used": seed, "steps_run": total, "cancelled": False, "image": p["output"],
               "quality": {"tier": engine.get("tier", "auto")}, "models": {"dit": {"certified": not p.get("loras")}}}
-    send({"event": "done", "id": j["id"], "status": "ok", "image": p["output"], "report": report,
+    finish(j, {"event": "done", "id": j["id"], "status": "ok", "image": p["output"], "report": report,
           "certified": not p.get("loras") and "control" not in p, "warnings": warnings})
 
 
@@ -248,10 +270,10 @@ def run_preload(j, p):
         progress(j["id"], phase, 0, 0, 0.0, 0.0)
         time.sleep(DELAY)
         if j["cancel"].is_set():
-            send({"event": "done", "id": j["id"], "status": "cancelled", "steps_run": 0, "report": {},
+            finish(j, {"event": "done", "id": j["id"], "status": "cancelled", "steps_run": 0, "report": {},
                   "certified": True, "warnings": []})
             return
-    send({"event": "done", "id": j["id"], "status": "ok", "report": {}, "preload_note": "",
+    finish(j, {"event": "done", "id": j["id"], "status": "ok", "report": {}, "preload_note": "",
           "dit_load": {"source": "files", "io": "direct", "bytes": 1, "seconds": 0.1, "note": ""},
           "certified": True, "warnings": []})
 
@@ -262,7 +284,8 @@ def worker(j, fn, p):
         fn(j, p)
     finally:
         with state_lock:
-            job = None
+            if job is j:
+                job = None
 
 
 def handle(msg):
@@ -281,7 +304,7 @@ def handle(msg):
         if method == "hello":
             if p.get("protocol_version", PROTOCOL) != PROTOCOL:
                 return err("unsupported_protocol", "unsupported protocol version")
-            return ok({"protocol_version": PROTOCOL, "server": "moss-server", "version": VERSION, "abi_version": 1,
+            return ok({"protocol_version": PROTOCOL, "server": "moss-server", "version": VERSION, "abi_version": ABI,
                        "capabilities": {c: v for c, v in CAPS.items() if v or c in DEFAULT_CAPS.split(",")},
                        "probe": {"message": "fake probe", "device_count": 1, "supported_device_count": 1}})
         if method == "status":
@@ -290,7 +313,7 @@ def handle(msg):
                 if engine is not None:
                     r.update(model=engine["model"], mode=engine.get("mode", "balanced"))
                 if job is not None:
-                    r.update(state={"generate": "generating", "preload": "preloading"}[job["kind"]],
+                    r.update(state={"generate": "generating", "preload": "preloading", "release": "releasing"}[job["kind"]],
                              generating_id=job["id"], cancelling=job["cancel"].is_set(),
                              phase=job.get("phase", "text_encoder"), step=job["step"], total_steps=job["total"],
                              elapsed_seconds=0.1)
@@ -352,13 +375,27 @@ def handle(msg):
             with state_lock:
                 if job is not None:
                     return err("busy", "a job is running")
-            if engine is None:
-                return err("no_engine", "no engine is loaded")
-            time.sleep(DELAY)
+                if engine is None:
+                    return err("no_engine", "no engine is loaded")
+                j = {"id": req_id, "kind": "release", "cancel": threading.Event(), "step": 0, "total": 0}
+                job = j
             keep = p.get("keep_host_copy", True)
-            return ok({"cancelled": False, "seconds": DELAY, "vram_released_bytes": 1 << 30,
-                       "host_copy_bytes": (1 << 29) if keep else 0, "host_copy_seconds": DELAY,
-                       "dit_host_copy": keep, "te_host_copy": False, "note": ""})
+
+            def run_release():
+                global job
+                cancelled = j["cancel"].wait(RELEASE_DELAY)
+                with state_lock:
+                    job = None
+                if cancelled:
+                    return ok({"cancelled": True, "seconds": 0.0, "vram_released_bytes": 0, "host_copy_bytes": 0,
+                               "host_copy_seconds": 0.0, "dit_host_copy": False, "te_host_copy": False,
+                               "note": "cancelled before it started"})
+                ok({"cancelled": False, "seconds": RELEASE_DELAY, "vram_released_bytes": 1 << 30,
+                    "host_copy_bytes": (1 << 29) if keep else 0, "host_copy_seconds": RELEASE_DELAY,
+                    "dit_host_copy": keep, "te_host_copy": False, "note": ""})
+
+            threading.Thread(target=run_release, daemon=True).start()
+            return
         if method in ("generate", "preload"):
             if method == "preload" and not CAPS["preload"]:
                 return err("method_not_found", "unknown method: preload")

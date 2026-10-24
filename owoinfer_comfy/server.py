@@ -12,9 +12,9 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
-import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterator
 log = logging.getLogger("owoinfer")
 
 PROTOCOL_VERSION = 1
+ABI_VERSION = 1
 CLIENT_NAME = "ComfyUI-MossImage-owoinfer"
 SERVER_ENV = "MOSSINFER_SERVER"
 SERVER_EXE = "moss-server.exe" if os.name == "nt" else "moss-server"
@@ -31,7 +32,9 @@ LOG_NAME = "ComfyUI-MossImage-owoinfer.moss-server.log"
 
 REQUEST_TIMEOUT = 120.0  # hello, load, status, cancel, unload: all answer quickly
 SHUTDOWN_TIMEOUT = 5.0  # `shutdown` waits for a running job's cancel, then exits
-CANCEL_TIMEOUT = 30.0  # a cancel stops a job within one layer or block
+CANCEL_SILENCE = 30.0  # after a cancel, this long without any event means the server hangs
+RELEASE_TIMEOUT = 600.0  # a release reads the DiT into RAM: seconds, at worst minutes
+POLL = 0.1
 
 
 class MossInferError(Exception):
@@ -60,13 +63,18 @@ def _is_exe(path: str) -> bool:
     return os.path.isfile(path) and os.access(path, os.X_OK)
 
 
+def _version_key(name: str) -> tuple:
+    """Sort key for release folder names: the numbers in them, compared as numbers."""
+    return tuple(int(n) for n in re.findall(r"\d+", name)), name
+
+
 def pack_server_candidates(pack_dir: str = PACK_DIR) -> list[str]:
     """`<pack>/bin/moss-server`, or a release archive extracted into `<pack>/bin/`
-    (`bin/bin/moss-server`, `bin/<archive folder>/bin/moss-server`)."""
+    (`bin/bin/moss-server`, `bin/<archive folder>/bin/moss-server`, newest version first)."""
     bin_dir = os.path.join(pack_dir, "bin")
     found = [os.path.join(bin_dir, SERVER_EXE), os.path.join(bin_dir, "bin", SERVER_EXE)]
     try:
-        subdirs = sorted(os.listdir(bin_dir), reverse=True)  # newest version name first
+        subdirs = sorted(os.listdir(bin_dir), key=_version_key, reverse=True)
     except OSError:
         subdirs = []
     for name in subdirs:
@@ -74,23 +82,13 @@ def pack_server_candidates(pack_dir: str = PACK_DIR) -> list[str]:
     return found
 
 
-def locate_server(
-    override: str = "",
-    pack_dir: str = PACK_DIR,
-    environ: dict[str, str] | None = None,
-    which: Callable[[str], str | None] = shutil.which,
-) -> str:
-    """The moss-server to run: `override`, then $MOSSINFER_SERVER, then the pack's
-    bin/ folder, then PATH."""
+def locate_server(pack_dir: str = PACK_DIR, environ: dict[str, str] | None = None,
+                  which: Callable[[str], str | None] = shutil.which) -> str:
+    """The moss-server to run: $MOSSINFER_SERVER, then the pack's bin/ folder, then PATH.
+
+    Never a value from a workflow: whoever controls the workflow would choose the program.
+    """
     environ = os.environ if environ is None else environ
-    override = override.strip()
-    if override:
-        if os.path.basename(override).lower() != SERVER_EXE:
-            # A workflow file carries this value; never run another program from it.
-            raise ServerNotFound(f"server path must name a {SERVER_EXE} binary: {override}")
-        if not _is_exe(override):
-            raise ServerNotFound(f"server path is not an executable file: {override}")
-        return os.path.abspath(override)
     env_path = environ.get(SERVER_ENV, "").strip()
     if env_path:
         if not _is_exe(env_path):
@@ -107,28 +105,6 @@ def locate_server(
         f"{os.path.join(pack_dir, 'bin', SERVER_EXE)} (extract a MossInfer release into "
         f"{os.path.join(pack_dir, 'bin')}); and PATH."
     )
-
-
-def probe_hello(server_path: str, timeout: float = 20.0) -> dict[str, Any]:
-    """A one-shot `hello` from a short-lived server process (no engine, no VRAM)."""
-    lines = (
-        json.dumps({"id": "probe", "method": "hello",
-                    "params": {"client": CLIENT_NAME, "protocol_version": PROTOCOL_VERSION}})
-        + "\n" + json.dumps({"id": "bye", "method": "shutdown"}) + "\n"
-    )
-    proc = subprocess.run([server_path], input=lines.encode(), stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL, timeout=timeout, **_popen_extra())
-    for raw in proc.stdout.splitlines():
-        try:
-            msg = json.loads(raw)
-        except ValueError:
-            continue
-        if msg.get("id") == "probe":
-            if "error" in msg:
-                err = msg["error"]
-                raise MossInferError(err.get("code", "internal"), err.get("message", ""))
-            return msg["result"]
-    raise ServerCrashed(f"{server_path} exited (status {proc.returncode}) without answering hello")
 
 
 def _popen_extra() -> dict[str, Any]:
@@ -205,15 +181,20 @@ class ServerProcess:
         self._log_file = open(log_path, "ab")
         self._log_file.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(argv)}\n".encode())
         self._log_file.flush()
+        self._log_start = self._log_file.tell()  # this process's lines start here
         self._ids = itertools.count(1)
         self._lock = threading.Lock()  # guards _pending, _subs, _dead_reason
         self._write_lock = threading.Lock()
         self._pending: dict[str, queue.Queue] = {}
         self._subs: dict[str, queue.Queue] = {}
         self._dead_reason: str | None = None
-        self.proc = _get_spawner().call(lambda: subprocess.Popen(
-            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log_file,
-            bufsize=0, close_fds=True, env=env, **_popen_extra()))
+        try:
+            self.proc = _get_spawner().call(lambda: subprocess.Popen(
+                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log_file,
+                close_fds=True, env=env, **_popen_extra()))
+        except BaseException:
+            self._log_file.close()
+            raise
         self._reader = threading.Thread(target=self._read_loop, name="moss-server-reader", daemon=True)
         self._reader.start()
 
@@ -227,21 +208,27 @@ class ServerProcess:
     # reading -----------------------------------------------------------------
 
     def _read_loop(self) -> None:
-        stdout = self.proc.stdout
-        assert stdout is not None
-        for raw in iter(stdout.readline, b""):
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                log.warning("moss-server: unparsable line: %r", line[:200])
-                continue
-            if isinstance(msg, dict):
-                self._dispatch(msg)
-        code = self.proc.wait()
-        self._mark_dead(f"moss-server exited with status {code}{self._log_tail()}")
+        reason = "moss-server's output ended"
+        try:
+            stdout = self.proc.stdout
+            assert stdout is not None
+            for raw in iter(stdout.readline, b""):
+                try:
+                    line = raw.strip()
+                    if line:
+                        msg = json.loads(line)
+                        if not isinstance(msg, dict):
+                            raise ValueError("not a JSON object")
+                        self._dispatch(msg)
+                except Exception as e:  # one bad line must not stop the reader
+                    log.warning("moss-server: bad protocol line (%s): %r", e, raw[:200])
+            code = self.proc.wait()
+            reason = f"moss-server exited with status {code}"
+        except Exception as e:
+            reason = f"reading moss-server's output failed: {e}"
+        finally:
+            # Every waiter wakes, whatever ended the loop.
+            self._mark_dead(reason + self._log_tail())
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
         msg_id = msg.get("id")
@@ -261,7 +248,7 @@ class ServerProcess:
         if slot is not None:
             slot.put(msg)
         elif "error" in msg:
-            err = msg["error"]
+            err = msg["error"] or {}
             log.error("moss-server: %s: %s", err.get("code"), err.get("message"))
 
     def _mark_dead(self, reason: str) -> None:
@@ -279,15 +266,17 @@ class ServerProcess:
             pass
 
     def _log_tail(self, lines: int = 6) -> str:
+        """The last stderr lines of this process (not of earlier ones in the same file)."""
         try:
-            self._log_file.flush()
+            if not self._log_file.closed:
+                self._log_file.flush()
             with open(self.log_path, "rb") as f:
                 f.seek(0, os.SEEK_END)
-                f.seek(max(0, f.tell() - 4096))
+                f.seek(max(self._log_start, f.tell() - 4096))
                 tail = f.read().decode("utf-8", "replace").splitlines()[-lines:]
         except (OSError, ValueError):
             return ""
-        tail = [t for t in tail if t.strip() and not t.startswith("=== ")]
+        tail = [t for t in tail if t.strip()]
         return (". Last log lines: " + " | ".join(tail)) if tail else f". Log: {self.log_path}"
 
     # writing -----------------------------------------------------------------
@@ -303,9 +292,9 @@ class ServerProcess:
                 self._mark_dead(f"moss-server is not running ({e}){self._log_tail()}")
                 raise ServerCrashed(self._dead_reason or "moss-server is not running") from None
 
-    def request(self, method: str, params: dict[str, Any] | None = None, *,
-                req_id: str | None = None, timeout: float | None = REQUEST_TIMEOUT) -> dict[str, Any]:
-        """Send a request and wait for its response; raise MossInferError on `error`."""
+    def start_request(self, method: str, params: dict[str, Any] | None = None, *,
+                      req_id: str | None = None) -> tuple[str, queue.Queue]:
+        """Send a request; its response arrives on the returned queue (see reply())."""
         req_id = req_id or self.next_id()
         slot: queue.Queue = queue.Queue(maxsize=1)
         with self._lock:
@@ -316,18 +305,32 @@ class ServerProcess:
         if params is not None:
             msg["params"] = params
         self._send(msg)
-        try:
-            reply = slot.get(timeout=timeout)
-        except queue.Empty:
-            with self._lock:
-                self._pending.pop(req_id, None)
-            raise MossInferError("timeout", f"moss-server did not answer {method} within {timeout:.0f} s") from None
-        if isinstance(reply, _Dead):
-            raise ServerCrashed(reply.reason)
-        if "error" in reply:
-            err = reply["error"] or {}
+        return req_id, slot
+
+    @staticmethod
+    def reply(msg: Any) -> dict[str, Any]:
+        """A response's result; MossInferError for an error, ServerCrashed for a dead server."""
+        if isinstance(msg, _Dead):
+            raise ServerCrashed(msg.reason)
+        if "error" in msg:
+            err = msg["error"] or {}
             raise MossInferError(str(err.get("code", "internal")), str(err.get("message", "")))
-        return reply.get("result") or {}
+        return msg.get("result") or {}
+
+    def forget(self, req_id: str) -> None:
+        with self._lock:
+            self._pending.pop(req_id, None)
+
+    def request(self, method: str, params: dict[str, Any] | None = None, *,
+                req_id: str | None = None, timeout: float | None = REQUEST_TIMEOUT) -> dict[str, Any]:
+        """Send a request and wait for its response; raise MossInferError on `error`."""
+        req_id, slot = self.start_request(method, params, req_id=req_id)
+        try:
+            msg = slot.get(timeout=timeout)
+        except queue.Empty:
+            self.forget(req_id)
+            raise MossInferError("timeout", f"moss-server did not answer {method} within {timeout:.0f} s") from None
+        return self.reply(msg)
 
     def subscribe(self, job_id: str) -> queue.Queue:
         q: queue.Queue = queue.Queue()
@@ -395,9 +398,13 @@ class Session:
             self._m._after_error(e)
             raise
 
-    def ensure_loaded(self, load_params: dict[str, Any]) -> bool:
-        """`load` unless the engine already runs exactly this config. True if it loaded."""
-        key = json.dumps(load_params, sort_keys=True)
+    def ensure_loaded(self, load_params: dict[str, Any], stamp: Any = None) -> bool:
+        """`load` unless the engine already runs exactly this config. True if it loaded.
+
+        `stamp` (e.g. the model files' sizes and mtimes) is part of the config, so a
+        replaced file loads again.
+        """
+        key = json.dumps([load_params, stamp], sort_keys=True, default=str)
         if key == self._m._loaded_key:
             return False
         self._m._loaded_key = None  # a failed load leaves no engine
@@ -409,29 +416,50 @@ class Session:
         self.request("unload")
         self._m._loaded_key = None
 
-    def release(self, keep_host_copy: bool = True) -> dict[str, Any]:
+    def release(self, keep_host_copy: bool = True, *, should_cancel: Callable[[], bool] | None = None,
+                timeout: float = RELEASE_TIMEOUT) -> dict[str, Any]:
+        """`release` (a soft unload). It runs like a job: `should_cancel()` sends a `cancel`."""
         if not self.has("release"):
             raise MossInferError("not_supported",
                                  f"release needs a moss-server with the 'release' capability (this one is {self.version})")
-        return self.request("release", {"keep_host_copy": keep_host_copy}, timeout=None)
+        m = self._m
+        proc = m._require_proc()
+        try:
+            req_id, slot = proc.start_request("release", {"keep_host_copy": keep_host_copy})
+            deadline = time.monotonic() + timeout
+            cancelled = False
+            while True:
+                try:
+                    return proc.reply(slot.get(timeout=POLL))
+                except queue.Empty:
+                    pass
+                if not cancelled and should_cancel is not None and should_cancel():
+                    cancelled = True
+                    proc.start_request("cancel", {"id": req_id})  # its answer is not needed
+                if time.monotonic() > deadline:
+                    proc.forget(req_id)
+                    raise MossInferError("timeout", f"moss-server did not finish release within {timeout:.0f} s")
+        except MossInferError as e:
+            m._after_error(e)
+            raise
 
     def run_job(self, method: str, params: dict[str, Any], *,
                 on_event: Callable[[dict[str, Any]], None] | None = None,
                 should_cancel: Callable[[], bool] | None = None,
-                poll: float = 0.1, cancel_timeout: float = CANCEL_TIMEOUT) -> dict[str, Any]:
+                poll: float = POLL, cancel_silence: float = CANCEL_SILENCE) -> dict[str, Any]:
         """Run a `generate` or `preload` and return its `done` event.
 
         Events other than `done` go to `on_event`. When `should_cancel()` turns true,
         or `on_event` raises, a `cancel` goes out and the job is drained to its `done`;
-        an exception from `on_event` is then re-raised. A job that does not end within
-        `cancel_timeout` after the cancel has its process killed.
+        an exception from `on_event` is then re-raised. After a cancel, a server that
+        sends nothing for `cancel_silence` seconds is killed.
         """
         m = self._m
         proc = m._require_proc()
         job_id = proc.next_id("job")
         events = proc.subscribe(job_id)
         deferred: BaseException | None = None
-        cancel_at: float | None = None
+        silent_since: float | None = None  # set once the cancel is out
         try:
             try:
                 proc.request(method, params, req_id=job_id)
@@ -439,23 +467,30 @@ class Session:
                 m._after_error(e)
                 raise
             while True:
-                if cancel_at is None and (deferred is not None or (should_cancel is not None and should_cancel())):
-                    cancel_at = time.monotonic()
+                if silent_since is None and (deferred is not None or (should_cancel is not None and should_cancel())):
                     try:
-                        proc.request("cancel", {"id": job_id})
+                        proc.start_request("cancel", {"id": job_id})  # its answer is not needed
                     except MossInferError as e:
                         m._after_error(e)
                         raise
-                if cancel_at is not None and time.monotonic() - cancel_at > cancel_timeout:
-                    m._discard_process(kill=True)
-                    raise MossInferError("cancel_timeout",
-                                         f"moss-server did not stop within {cancel_timeout:.0f} s of a cancel; it was killed")
+                    silent_since = time.monotonic()
                 try:
                     msg = events.get(timeout=poll)
                 except queue.Empty:
+                    if silent_since is not None and time.monotonic() - silent_since > cancel_silence:
+                        m._discard_process(kill=True)
+                        if deferred is not None:
+                            raise deferred from None
+                        raise MossInferError(
+                            "cancel_timeout",
+                            f"moss-server sent nothing for {cancel_silence:.0f} s after a cancel; it was killed") from None
                     continue
+                if silent_since is not None:
+                    silent_since = time.monotonic()
                 if isinstance(msg, _Dead):
                     m._discard_process()
+                    if deferred is not None:
+                        raise deferred
                     raise ServerCrashed(msg.reason)
                 if msg.get("event") == "done":
                     done = msg
@@ -510,12 +545,6 @@ class ServerManager:
             self._ensure_process(server_path)
             yield Session(self)
 
-    def cached_hello(self, server_path: str) -> dict[str, Any] | None:
-        proc = self.running
-        if proc is not None and proc.server_path == server_path:
-            return self._hello
-        return None
-
     def _ensure_process(self, server_path: str) -> None:
         if self._proc is not None and (not self._proc.alive or self._proc.server_path != server_path):
             self._discard_process()
@@ -539,10 +568,14 @@ class ServerManager:
         except MossInferError:
             self._discard_process(kill=True)
             raise
+        problem = ""
         if hello.get("protocol_version") != PROTOCOL_VERSION:
+            problem = f"speaks protocol {hello.get('protocol_version')}, not {PROTOCOL_VERSION}"
+        elif hello.get("abi_version") != ABI_VERSION:
+            problem = f"has engine ABI {hello.get('abi_version')}, not {ABI_VERSION}"
+        if problem:
             self._discard_process()
-            raise MossInferError("unsupported_protocol",
-                                 f"{server_path} speaks protocol {hello.get('protocol_version')}, not {PROTOCOL_VERSION}")
+            raise MossInferError("unsupported_protocol", f"{server_path} {problem}; use a MossInfer 1.x release")
         self._hello = hello
         probe = hello.get("probe") or {}
         log.info("moss-server %s started (%s); %s", hello.get("version"), server_path, probe.get("message", ""))
@@ -578,9 +611,3 @@ class ServerManager:
         proc, self._proc = self._proc, None
         if proc is not None:
             proc.stop()
-
-
-if __name__ == "__main__":  # `python -m owoinfer_comfy.server [path]`: print hello
-    logging.basicConfig(level=logging.INFO)
-    path = locate_server(sys.argv[1] if len(sys.argv) > 1 else "")
-    print(json.dumps(probe_hello(path), indent=2))

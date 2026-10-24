@@ -3,6 +3,7 @@
 import json
 import os
 import stat
+import struct
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -80,3 +81,20 @@ def gpu_skip_reason(server=GPU_SERVER, files=(SFT, DIT_INT8, TE_INT8)):
     if avail < MIN_FREE_RAM_GIB:
         return f"only {avail:.1f} GiB RAM available (need {MIN_FREE_RAM_GIB})"
     return ""
+
+
+def write_safetensors(path, tensors, metadata=None, blobs=None):
+    """tensors: name -> (dtype, shape); blobs: name -> bytes for U8 tensors."""
+    blobs = blobs or {}
+    header, data, offset = {}, b"", 0
+    for name, (dtype, shape) in tensors.items():
+        payload = blobs.get(name, b"\0" * 4)
+        header[name] = {"dtype": dtype, "shape": shape if name not in blobs else [len(payload)],
+                        "data_offsets": [offset, offset + len(payload)]}
+        data += payload
+        offset += len(payload)
+    if metadata:
+        header["__metadata__"] = metadata
+    raw = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(raw)) + raw + data)

@@ -6,7 +6,7 @@ import struct
 
 import pytest
 
-from helpers import make_bundle, recorded
+from helpers import make_bundle, recorded, write_safetensors
 from owoinfer_comfy import logic
 from owoinfer_comfy.logic import ControlImage, MossControl, MossModel, ProgressMapper
 from owoinfer_comfy.server import MossInferError, ServerManager
@@ -16,23 +16,6 @@ COMMUNITY = "/workspace/Models/community"
 ALL = {c: True for c in ("preview", "model_files", "lora", "tiers", "samplers", "image_input", "hires",
                          "distill", "control", "accel", "release", "preload", "progress_fraction")}
 OLD = {"preview": True, "model_files": True, "lora": True, "tiers": True}  # a minimal build
-
-
-def write_safetensors(path, tensors, metadata=None, blobs=None):
-    """tensors: name -> (dtype, shape); blobs: name -> bytes for U8 tensors."""
-    blobs = blobs or {}
-    header, data, offset = {}, b"", 0
-    for name, (dtype, shape) in tensors.items():
-        payload = blobs.get(name, b"\0" * 4)
-        header[name] = {"dtype": dtype, "shape": shape if name not in blobs else [len(payload)],
-                        "data_offsets": [offset, offset + len(payload)]}
-        data += payload
-        offset += len(payload)
-    if metadata:
-        header["__metadata__"] = metadata
-    raw = json.dumps(header).encode()
-    with open(path, "wb") as f:
-        f.write(struct.pack("<Q", len(raw)) + raw + data)
 
 
 def values(**kw):
@@ -111,19 +94,74 @@ def test_dit_quant_kind_community_files(name, kind):
     assert logic.dit_quant_kind(path) == kind
 
 
-def test_resolve_tier():
-    assert logic.resolve_tier("auto", None) == ("auto", "")
-    assert logic.resolve_tier("high", "int8") == ("high", "")
-    assert logic.resolve_tier("reference", "int8") == ("reference", "")  # the engine refuses it, with its message
-    tier, note = logic.resolve_tier("auto", "int4")
-    assert tier == "turbo" and "turbo" in note
-    assert logic.resolve_tier("turbo", "int4") == ("turbo", "")
-    with pytest.raises(ValueError, match="only under tier turbo"):
-        logic.resolve_tier("high", "int4")
-    with pytest.raises(ValueError, match="turbo runs only an INT4 DiT file, not the folder's own DiT"):
-        logic.resolve_tier("turbo", None)
-    with pytest.raises(ValueError, match=r"not this DiT file \(int8\)"):
-        logic.resolve_tier("turbo", "int8")
+def test_dit_quant_kind_malformed_headers(tmp_path):
+    """Crafted headers give "unknown", never an exception."""
+    cases = {
+        "qmeta_dict": {"__metadata__": {"_quantization_metadata": {"layers": {}}}, "w": {"dtype": "I8", "shape": [1], "data_offsets": [0, 1]}},
+        "qmeta_layers_list": {"__metadata__": {"_quantization_metadata": json.dumps({"layers": [1, 2]})}},
+        "qmeta_not_json": {"__metadata__": {"_quantization_metadata": "{oops"}},
+        "metadata_list": {"__metadata__": ["x"]},
+        "offsets_null": {"a.comfy_quant": {"dtype": "U8", "shape": [1], "data_offsets": None}},
+        "offsets_strings": {"a.comfy_quant": {"dtype": "U8", "shape": [1], "data_offsets": ["0", "4"]}},
+        "offsets_backwards": {"a.comfy_quant": {"dtype": "U8", "shape": [1], "data_offsets": [8, 2]}},
+        "tensor_not_object": {"w": 5},
+    }
+    for name, header in cases.items():
+        raw = json.dumps(header).encode()
+        path = tmp_path / f"{name}.safetensors"
+        path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"\0" * 16)
+        assert logic.dit_quant_kind(str(path)) in ("unknown", "bf16", "fp8"), name
+    top_list = tmp_path / "list.safetensors"
+    top_list.write_bytes(struct.pack("<Q", 2) + b"[]")
+    huge = tmp_path / "huge.safetensors"
+    huge.write_bytes(struct.pack("<Q", logic.MAX_HEADER_BYTES + 1) + b"{}")
+    assert logic.dit_quant_kind(str(top_list)) == "unknown" and logic.dit_quant_kind(str(huge)) == "unknown"
+
+
+def test_tier_problem():
+    assert logic.tier_problem("auto", None) == ""
+    assert logic.tier_problem("high", "int8") == ""
+    assert logic.tier_problem("reference", "int8") == ""  # the engine refuses it, with its message
+    assert logic.tier_problem("turbo", "int4") == ""
+    # auto is sent unchanged, never rewritten: the user picks turbo
+    assert logic.tier_problem("auto", "int4") == "INT4 DiT file: choose tier turbo (lossy, uncertified)"
+    assert logic.tier_problem("high", "int4") == ""  # the engine decides
+    assert "not the folder's own DiT" in logic.tier_problem("turbo", None)
+    for kind in ("int8", "bf16", "fp8", "nvfp4"):
+        assert f"not this DiT file ({kind})" in logic.tier_problem("turbo", kind)
+    assert logic.tier_problem("turbo", "unknown") == ""  # a file the pack cannot read goes to the engine
+
+
+def test_file_and_model_stamps(tmp_path):
+    bundle = make_bundle(str(tmp_path / "b"))
+    dit = tmp_path / "dit.safetensors"
+    dit.write_bytes(b"one")
+    m = MossModel(bundle, dit_file=str(dit))
+    first = m.stamp()
+    assert first == m.stamp()
+    assert logic.file_stamp(str(dit))[2] == 3
+    dit.write_bytes(b"three")  # replaced: another size and mtime
+    assert m.stamp() != first
+    second = m.stamp()
+    with open(os.path.join(bundle, "transformer", "diffusion_pytorch_model.safetensors"), "wb") as f:
+        f.write(b"w")  # a weight file added to the folder
+    assert m.stamp() != second
+    assert logic.file_stamp(str(tmp_path / "missing")) is None
+
+
+def test_find_bundles_is_cached_until_a_folder_changes(tmp_path, monkeypatch):
+    root = tmp_path / "moss_image"
+    make_bundle(str(root / "a"))
+    walks = []
+    real_walk = os.walk
+    monkeypatch.setattr(logic.os, "walk", lambda *a, **kw: (walks.append(a[0]), real_walk(*a, **kw))[1])
+    assert list(logic.find_bundles([str(root)])) == ["a"]
+    assert list(logic.find_bundles([str(root)])) == ["a"]
+    assert len(walks) == 1  # the second call only checked mtimes
+    make_bundle(str(root / "nested" / "b"))
+    assert list(logic.find_bundles([str(root)])) == ["a", "nested/b"]
+    os.remove(root / "a" / "vae" / "config.json")  # a bundle broken inside one of its parts
+    assert list(logic.find_bundles([str(root)])) == ["nested/b"]
 
 
 # the model config ---------------------------------------------------------------------------

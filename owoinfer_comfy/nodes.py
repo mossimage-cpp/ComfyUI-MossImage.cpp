@@ -4,20 +4,19 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import uuid
 from typing import Any
 
 import comfy.model_management as mm
 import comfy.utils
 import folder_paths
-from comfy.cli_args import args
+from comfy.cli_args import LatentPreviewMethod, args
 from comfy_api.latest import ComfyExtension, io
 
 from . import logic
 from .imaging import load_image_tensor, load_preview, save_image_png, save_mask_png
 from .logic import FROM_FOLDER, ControlImage, MossControl, MossModel, ProgressMapper
-from .server import MossInferError, ServerManager, ServerNotFound, locate_server, probe_hello
+from .server import MossInferError, ServerManager, locate_server
 
 log = logging.getLogger("owoinfer")
 
@@ -38,33 +37,12 @@ _manager: ServerManager | None = None
 
 
 def get_manager() -> ServerManager:
-    """The one moss-server of this ComfyUI process, shut down at exit."""
+    """The one moss-server of this ComfyUI process, started on the first run and shut down at exit."""
     global _manager
     if _manager is None:
         base = os.path.join(folder_paths.get_user_directory(), PACK)
         _manager = ServerManager(log_dir=base, cache_dir=os.path.join(base, "cache"))
     return _manager
-
-
-_probed: dict[str, dict[str, bool]] = {}
-
-
-def schema_capabilities() -> dict[str, bool]:
-    """The default server's capabilities, for the choices a node offers ({} without one)."""
-    try:
-        path = locate_server()
-    except ServerNotFound:
-        return {}
-    hello = get_manager().cached_hello(path)
-    if hello is not None:
-        return dict(hello.get("capabilities") or {})
-    if path not in _probed:
-        try:
-            _probed[path] = dict(probe_hello(path).get("capabilities") or {})
-        except (MossInferError, OSError, subprocess.SubprocessError) as e:
-            log.warning("%s: could not ask %s for its capabilities: %s", PACK, path, e)
-            _probed[path] = {}
-    return _probed[path]
 
 
 def _bundles() -> dict[str, str]:
@@ -73,6 +51,22 @@ def _bundles() -> dict[str, str]:
 
 def _file_choice(folder: str, name: str) -> str:
     return "" if name == FROM_FOLDER else folder_paths.get_full_path_or_raise(folder, name)
+
+
+def _stamp_of(folder: str, name: str):
+    path = None if name == FROM_FOLDER else folder_paths.get_full_path(folder, name)
+    return logic.file_stamp(path) if path else None
+
+
+def _progress_text(node_id: str | None, text: str) -> None:
+    """Text on the node (ComfyUI's progress text), when a front end is connected."""
+    if not node_id:
+        return
+    try:
+        from server import PromptServer  # ComfyUI's
+        PromptServer.instance.send_progress_text(text, node_id)
+    except (ImportError, AttributeError):
+        pass
 
 
 class ModelLoader(io.ComfyNode):
@@ -89,42 +83,58 @@ class ModelLoader(io.ComfyNode):
                 io.Combo.Input("model_folder", options=bundles,
                                tooltip=f"A MOSS-Image bundle folder (Base or SFT, from Hugging Face) under models/{MODEL_FOLDER}/. "
                                        "It supplies the tokenizer and configs, and the components not replaced below."),
-                io.Combo.Input("dit_file", options=[FROM_FOLDER] + folder_paths.get_filename_list("diffusion_models"),
-                               default=FROM_FOLDER, tooltip="A single-file DiT (ComfyUI / community INT8 ConvRot, INT4 ConvRot, bf16) from diffusion_models."),
+                io.Combo.Input("dit_file", options=cls._dit_options(), default=FROM_FOLDER,
+                               tooltip="A single-file DiT (ComfyUI / community INT8 ConvRot, INT4 ConvRot, bf16) "
+                                       "from diffusion_models."),
                 io.Combo.Input("text_encoder_file", options=[FROM_FOLDER] + folder_paths.get_filename_list("text_encoders"),
-                               default=FROM_FOLDER, tooltip="A single-file Qwen3.5-9B text encoder (INT8 ConvRot or W4A8) from text_encoders."),
+                               default=FROM_FOLDER,
+                               tooltip="A single-file Qwen3.5-9B text encoder (INT8 ConvRot or W4A8) from text_encoders."),
                 io.Combo.Input("vae_file", options=[FROM_FOLDER] + folder_paths.get_filename_list("vae"),
                                default=FROM_FOLDER, tooltip="A single-file FLUX.2 VAE from vae."),
                 io.Combo.Input("mode", options=logic.MODES, default="balanced",
-                               tooltip="Memory mode. balanced adapts to free VRAM; min_memory shares the GPU with other apps; max_speed uses the RAM it can."),
+                               tooltip="Memory mode. balanced adapts to free VRAM; min_memory shares the GPU with "
+                                       "other apps; max_speed uses the RAM it can."),
                 io.Combo.Input("tier", options=logic.TIERS, default="auto",
-                               tooltip="Quality tier. auto picks the fastest certified configuration. turbo runs only an INT4 DiT file, "
-                                       "and auto turns into turbo for one."),
+                               tooltip="Quality tier. auto picks the fastest certified configuration. "
+                                       "turbo (lossy, uncertified) is for INT4 DiT files only, and they need it."),
                 io.Combo.Input("attention", options=logic.ATTENTIONS, default="default", advanced=True,
                                tooltip="Overrides the tier's attention: exact or an 8-bit mode."),
-                io.String.Input("server_path", default="", advanced=True,
-                                tooltip="A moss-server binary to run instead of the default ($MOSSINFER_SERVER, this pack's bin/, then PATH)."),
             ],
             outputs=[MossModelType.Output(display_name="moss_model")],
         )
 
+    @staticmethod
+    def _dit_options() -> list[str]:
+        return [FROM_FOLDER] + folder_paths.get_filename_list("diffusion_models")
+
+    @classmethod
+    def validate_inputs(cls, dit_file, tier) -> bool | str:
+        # ComfyUI skips its own checks for the inputs named here, so they are repeated.
+        if dit_file not in cls._dit_options():
+            return f"dit_file not found in diffusion_models: {dit_file}"
+        if tier not in logic.TIERS:
+            return f"tier must be one of {', '.join(logic.TIERS)}"
+        dit = _file_choice("diffusion_models", dit_file)
+        return logic.tier_problem(tier, logic.dit_quant_kind(dit) if dit else None) or True
+
+    @classmethod
+    def fingerprint_inputs(cls, model_folder, dit_file, text_encoder_file, vae_file, **kwargs):
+        path = _bundles().get(model_folder)
+        return (tuple(logic.bundle_stamp(path)) if path else None,
+                _stamp_of("diffusion_models", dit_file), _stamp_of("text_encoders", text_encoder_file),
+                _stamp_of("vae", vae_file))
+
     @classmethod
     def execute(cls, model_folder, dit_file, text_encoder_file, vae_file, mode, tier,
-                attention="default", server_path="") -> io.NodeOutput:
+                attention="default") -> io.NodeOutput:
         bundles = _bundles()
         if model_folder not in bundles:
-            raise ValueError(f"MOSS-Image folder {model_folder!r} not found in {', '.join(folder_paths.get_folder_paths(MODEL_FOLDER))}")
-        dit = _file_choice("diffusion_models", dit_file)
-        tier_used, note = logic.resolve_tier(tier, logic.dit_quant_kind(dit) if dit else None)
-        if note:
-            log.info("MOSS-Image: %s", note)
-        if server_path.strip():
-            locate_server(server_path)  # a bad path fails here, with its reason
+            raise ValueError(f"MOSS-Image folder {model_folder!r} not found in "
+                             f"{', '.join(folder_paths.get_folder_paths(MODEL_FOLDER))}")
         return io.NodeOutput(MossModel(
-            model_dir=bundles[model_folder], dit_file=dit,
+            model_dir=bundles[model_folder], dit_file=_file_choice("diffusion_models", dit_file),
             text_encoder_file=_file_choice("text_encoders", text_encoder_file),
-            vae_file=_file_choice("vae", vae_file),
-            mode=mode, tier=tier_used, attention=attention, server_path=server_path.strip()))
+            vae_file=_file_choice("vae", vae_file), mode=mode, tier=tier, attention=attention))
 
 
 class LoRA(io.ComfyNode):
@@ -134,7 +144,8 @@ class LoRA(io.ComfyNode):
             node_id="OwoInferMossImageLoRA",
             display_name="MOSS-Image LoRA",
             category=CATEGORY,
-            description="Adds a LoRA (kohya, PEFT / diffusers, LyCORIS LoHa / LoKr, full deltas) to a MOSS-Image model. Chain several.",
+            description="Adds a LoRA (kohya, PEFT / diffusers, LyCORIS LoHa / LoKr, full deltas) to a MOSS-Image model. "
+                        "Chain several.",
             inputs=[
                 MossModelType.Input("moss_model"),
                 io.Combo.Input("lora_name", options=folder_paths.get_filename_list("loras")),
@@ -142,6 +153,10 @@ class LoRA(io.ComfyNode):
             ],
             outputs=[MossModelType.Output(display_name="moss_model")],
         )
+
+    @classmethod
+    def fingerprint_inputs(cls, lora_name, **kwargs):
+        return _stamp_of("loras", lora_name)
 
     @classmethod
     def execute(cls, moss_model: MossModel, lora_name: str, strength: float) -> io.NodeOutput:
@@ -163,16 +178,23 @@ class Control(io.ComfyNode):
                 io.Combo.Input("adapter", options=folder_paths.get_filename_list("loras"),
                                tooltip="The control adapter file, from loras."),
                 io.String.Input("kind", default="depth", tooltip="One of the adapter's kinds, e.g. depth or color."),
-                io.Image.Input("image", tooltip="The conditioning image; resized to the output size like an init image."),
+                io.Image.Input("image", tooltip="The conditioning image (the first of a batch); resized to the "
+                                                "output size like an init image."),
                 io.Float.Input("strength", default=1.0, min=0.0, max=10.0, step=0.01),
-                io.Float.Input("start", default=0.0, min=0.0, max=1.0, step=0.01, tooltip="Share of the steps where the control starts."),
-                io.Float.Input("end", default=1.0, min=0.0, max=1.0, step=0.01, tooltip="Share of the steps where the control ends."),
+                io.Float.Input("start", default=0.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="Share of the steps where the control starts."),
+                io.Float.Input("end", default=1.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="Share of the steps where the control ends."),
                 io.Float.Input("lora_strength", default=1.0, min=-10.0, max=10.0, step=0.01,
-                               tooltip="Strength of the adapter's LoRA part (the first node of a chain sets it)."),
+                               tooltip="Strength of the adapter's LoRA part; the same on every node of a chain."),
                 MossControlType.Input("control", optional=True, tooltip="Another kind's control, for the same adapter."),
             ],
             outputs=[MossControlType.Output(display_name="control")],
         )
+
+    @classmethod
+    def fingerprint_inputs(cls, adapter, **kwargs):
+        return _stamp_of("loras", adapter)
 
     @classmethod
     def execute(cls, adapter, kind, image, strength, start, end, lora_strength, control=None) -> io.NodeOutput:
@@ -181,18 +203,23 @@ class Control(io.ComfyNode):
             control = MossControl(path, lora_strength)
         elif control.adapter != path:
             raise ValueError("chained MOSS-Image Control nodes must use the same adapter file")
+        elif control.lora_strength != lora_strength:
+            raise ValueError(f"chained MOSS-Image Control nodes must use the same lora_strength "
+                             f"({control.lora_strength} and {lora_strength}): the adapter has one LoRA part")
+        if image.shape[0] > 1:
+            log.warning("MOSS-Image Control: image is a batch of %d; using the first", image.shape[0])
         return io.NodeOutput(control.with_image(ControlImage(kind.strip(), image, strength, start, end)))
 
 
 class Generate(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
-        caps = schema_capabilities()
         return io.Schema(
             node_id="OwoInferMossImageGenerate",
             display_name="MOSS-Image Generate",
             category=CATEGORY,
-            description="Generates an image with owoinfer (moss-server). Optional init image and mask for img2img and inpainting.",
+            description="Generates an image with owoinfer (moss-server). Optional init image and mask for img2img "
+                        "and inpainting.",
             inputs=[
                 MossModelType.Input("moss_model"),
                 io.String.Input("prompt", multiline=True, default=""),
@@ -207,7 +234,8 @@ class Generate(io.ComfyNode):
                                tooltip="moss with euler is the official pipeline."),
                 io.Float.Input("shift", default=5.0, min=0.01, max=100.0, step=0.01),
                 io.Image.Input("init_image", optional=True, tooltip="img2img: the starting image (the first of a batch)."),
-                io.Mask.Input("mask", optional=True, tooltip="Inpainting: 1 repaints, 0 keeps. The init image's size."),
+                io.Mask.Input("mask", optional=True,
+                              tooltip="Inpainting: 1 repaints, 0 keeps (the first of a batch). The init image's size."),
                 MossControlType.Input("control", optional=True),
                 io.Float.Input("denoise_strength", default=0.75, min=0.0, max=1.0, step=0.01,
                                tooltip="With an init image: the share of the schedule run from it."),
@@ -238,10 +266,13 @@ class Generate(io.ComfyNode):
                                tooltip="Lossy accelerator: the First-Block Cache."),
                 io.Float.Input("step_cache_threshold", default=0.0, min=0.0, max=1.0, step=0.001, advanced=True,
                                tooltip="0 = the engine's default for the model."),
-                io.Boolean.Input("preview", default=True, advanced=True, tooltip="Latent previews on the node while sampling."),
-                io.Combo.Input("after_run", options=logic.after_run_options(caps), default="keep", advanced=True,
-                               tooltip="keep: the model stays in VRAM. release: VRAM freed, weights kept in RAM for a fast reload. "
-                                       "unload: everything freed."),
+                io.Boolean.Input("preview", default=True, advanced=True,
+                                 tooltip="Latent previews on the node while sampling, unless ComfyUI's preview "
+                                         "method is none."),
+                io.Combo.Input("after_run", options=logic.AFTER_RUN, default="keep", advanced=True,
+                               tooltip="keep: the model stays in VRAM, which ComfyUI's memory manager cannot see. "
+                                       "release (moss-server with the release capability): VRAM freed, weights kept "
+                                       "in RAM for a fast reload. unload: everything freed."),
                 io.Boolean.Input("free_comfy_vram", default=True, advanced=True,
                                  tooltip="Unload ComfyUI's own models first, so they and the engine do not both hold VRAM."),
             ],
@@ -252,7 +283,7 @@ class Generate(io.ComfyNode):
     @classmethod
     def execute(cls, moss_model: MossModel, init_image=None, mask=None, control: MossControl | None = None,
                 **values: Any) -> io.NodeOutput:
-        server_path = locate_server(moss_model.server_path)
+        server_path = locate_server()
         if values.get("free_comfy_vram", True):
             mm.unload_all_models()
             mm.soft_empty_cache()
@@ -260,6 +291,7 @@ class Generate(io.ComfyNode):
         os.makedirs(tmp_dir, exist_ok=True)
         tag = uuid.uuid4().hex[:12]
         files: list[str] = []
+        node_id = cls.hidden.unique_id if cls.hidden is not None else None
 
         def tmp(name: str) -> str:
             files.append(os.path.join(tmp_dir, f"{tag}-{name}.png"))
@@ -273,6 +305,8 @@ class Generate(io.ComfyNode):
                 init_path = tmp("init")
                 save_image_png(init_image[0], init_path)
             if mask is not None:
+                if mask.dim() == 3 and mask.shape[0] > 1:
+                    log.warning("MOSS-Image Generate: mask is a batch of %d; using the first", mask.shape[0])
                 mask_path = tmp("mask")
                 save_mask_png(mask, mask_path)
             control_param = None
@@ -281,6 +315,7 @@ class Generate(io.ComfyNode):
                 for image, path in zip(control.images, paths):
                     save_image_png(image.image, path)
                 control_param = control.to_param(paths)
+            previews = values.get("preview", True) and args.preview_method != LatentPreviewMethod.NoPreviews
 
             manager = get_manager()
             with manager.session(server_path) as s:
@@ -289,12 +324,11 @@ class Generate(io.ComfyNode):
                 if after_run == "release" and not caps.get("release"):
                     raise logic.missing_capability("after_run release", "release", s.version)
                 params = logic.build_generate_params(
-                    values, caps, s.version, output=tmp("out"),
-                    preview_output=tmp("preview") if values.get("preview", True) else None,
+                    values, caps, s.version, output=tmp("out"), preview_output=tmp("preview") if previews else None,
                     init_image=init_path, mask=mask_path, loras=moss_model.loras, control=control_param)
-                s.ensure_loaded(moss_model.load_params(caps, s.version, manager.cache_dir))
+                s.ensure_loaded(moss_model.load_params(caps, s.version, manager.cache_dir), moss_model.stamp())
                 try:
-                    done = s.run_job("generate", params, on_event=cls._event_handler(caps, values["steps"]),
+                    done = s.run_job("generate", params, on_event=cls._event_handler(caps, values["steps"], node_id),
                                      should_cancel=mm.processing_interrupted)
                 except MossInferError as e:
                     if e.code == "cancel_timeout":
@@ -303,7 +337,7 @@ class Generate(io.ComfyNode):
                     raise
                 finally:
                     cls._after_run(s, after_run)
-            return io.NodeOutput(cls._result(done, params["output"]))
+            return io.NodeOutput(cls._result(done, params["output"], node_id))
         finally:
             for path in files:
                 try:
@@ -312,15 +346,9 @@ class Generate(io.ComfyNode):
                     pass
 
     @classmethod
-    def _event_handler(cls, caps: dict[str, bool], steps: int):
+    def _event_handler(cls, caps: dict[str, bool], steps: int, node_id: str | None):
         mapper = ProgressMapper(bool(caps.get("progress_fraction")), steps)
         pbar = comfy.utils.ProgressBar(mapper.total)
-        node_id = cls.hidden.unique_id if cls.hidden is not None else None
-        try:
-            from server import PromptServer  # ComfyUI's
-            prompt_server = PromptServer.instance
-        except (ImportError, AttributeError):
-            prompt_server = None
 
         def on_event(event: dict[str, Any]) -> None:
             kind = event.get("event")
@@ -328,8 +356,7 @@ class Generate(io.ComfyNode):
                 position = mapper.update(event)
                 if position is not None:
                     pbar.update_absolute(*position)
-                if prompt_server is not None and node_id:
-                    prompt_server.send_progress_text(logic.progress_text(event), node_id)
+                _progress_text(node_id, logic.progress_text(event))
             elif kind == "preview":
                 try:
                     image = load_preview(event["image"])
@@ -348,17 +375,21 @@ class Generate(io.ComfyNode):
             return
         try:
             if after_run == "release":
-                r = session.release(keep_host_copy=True)
-                log.info("MOSS-Image: released %.1f GiB of VRAM%s", r.get("vram_released_bytes", 0) / 2**30,
-                         ", DiT kept in RAM" if r.get("dit_host_copy") else (f" ({r['note']})" if r.get("note") else ""))
+                r = session.release(keep_host_copy=True, should_cancel=mm.processing_interrupted)
+                if r.get("cancelled"):
+                    log.info("MOSS-Image: release cancelled; the engine keeps its VRAM")
+                else:
+                    log.info("MOSS-Image: released %.1f GiB of VRAM%s", r.get("vram_released_bytes", 0) / 2**30,
+                             ", DiT kept in RAM" if r.get("dit_host_copy") else (f" ({r['note']})" if r.get("note") else ""))
             elif after_run == "unload":
                 session.unload()
         except MossInferError as e:
             log.warning("MOSS-Image: after_run %s failed: %s", after_run, e)
 
     @staticmethod
-    def _result(done: dict[str, Any], output: str):
-        for warning in done.get("warnings") or []:
+    def _result(done: dict[str, Any], output: str, node_id: str | None):
+        warnings = [str(w) for w in done.get("warnings") or []]
+        for warning in warnings:
             log.warning("MOSS-Image: %s", warning)
         status = done.get("status")
         if status == "cancelled":
@@ -369,8 +400,10 @@ class Generate(io.ComfyNode):
             raise MossInferError(str(err.get("code", "internal")), str(err.get("message", "generation failed")))
         report = done.get("report") or {}
         quality = report.get("quality") or {}
-        log.info("MOSS-Image: seed %s, tier %s, %s", report.get("seed_used"), quality.get("tier", "?"),
-                 "certified" if done.get("certified") else "uncertified")
+        summary = (f"seed {report.get('seed_used')}, tier {quality.get('tier', '?')}, "
+                   f"{'certified' if done.get('certified') else 'uncertified'}")
+        log.info("MOSS-Image: %s", summary)
+        _progress_text(node_id, "\n".join([summary] + [f"warning: {w}" for w in warnings]))
         return load_image_tensor(done.get("image") or output)
 
 

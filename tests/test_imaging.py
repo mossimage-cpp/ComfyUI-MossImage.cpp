@@ -1,5 +1,7 @@
 """Tensor <-> PNG conversion (needs torch, numpy and PIL, as ComfyUI has)."""
 
+import os
+
 import pytest
 
 torch = pytest.importorskip("torch", reason="torch is not installed in this Python; run the tests with ComfyUI's venv")
@@ -40,9 +42,12 @@ def test_mask(tmp_path):
         assert img.mode == "L" and img.getpixel((0, 0)) == 0 and img.getpixel((9, 5)) == 255
 
 
-def test_preview_is_closed_after_reading(tmp_path):
+def test_preview_is_read_in_full(tmp_path):
+    """The server renames the next preview over the file: what was read must not change with it."""
     path = tmp_path / "p.png"
     Image.new("RGB", (4, 2), (1, 2, 3)).save(path)
     img = load_preview(str(path))
-    path.unlink()  # nothing holds the file open
+    Image.new("RGB", (8, 8), (9, 9, 9)).save(tmp_path / "next.png")
+    os.replace(tmp_path / "next.png", path)
     assert img.size == (4, 2) and img.getpixel((0, 0)) == (1, 2, 3)
+    assert getattr(img, "fp", None) is None  # no file handle kept

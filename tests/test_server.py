@@ -43,14 +43,19 @@ def test_locate_order(tmp_path):
     assert srv.locate_server(pack_dir=str(pack), environ={}, which=which) == pack_srv
     os.remove(pack_srv)
     assert srv.locate_server(pack_dir=str(pack), environ={}, which=which) == path_srv
-    # An override wins over everything.
-    assert srv.locate_server(env_srv, pack_dir=str(pack), environ={}, which=which) == env_srv
 
 
-def test_locate_release_extracted_into_bin(tmp_path):
+def test_locate_takes_no_path_from_a_workflow():
+    """No caller can choose the program: the only inputs are the environment, the pack and PATH."""
+    import inspect
+    assert list(inspect.signature(srv.locate_server).parameters) == ["pack_dir", "environ", "which"]
+
+
+def test_locate_release_extracted_into_bin_newest_version_first(tmp_path):
     pack = tmp_path / "pack"
-    nested = make_fake_server(str(pack / "bin" / "mossinfer-1.0.0-linux-cu13-x86_64" / "bin"))
-    assert srv.locate_server(pack_dir=str(pack), environ={}, which=lambda n: None) == nested
+    make_fake_server(str(pack / "bin" / "mossinfer-1.9.0-linux-cu13-x86_64" / "bin"))
+    newest = make_fake_server(str(pack / "bin" / "mossinfer-1.10.0-linux-cu13-x86_64" / "bin"))
+    assert srv.locate_server(pack_dir=str(pack), environ={}, which=lambda n: None) == newest
 
 
 def test_locate_failure_names_every_place(tmp_path):
@@ -60,20 +65,9 @@ def test_locate_failure_names_every_place(tmp_path):
     assert srv.SERVER_ENV in msg and os.path.join(str(tmp_path), "bin") in msg and "PATH" in msg
 
 
-def test_locate_bad_env_and_override(tmp_path):
+def test_locate_bad_env(tmp_path):
     with pytest.raises(ServerNotFound, match=srv.SERVER_ENV):
         srv.locate_server(pack_dir=str(tmp_path), environ={srv.SERVER_ENV: str(tmp_path / "nope")})
-    with pytest.raises(ServerNotFound, match="must name a moss-server"):
-        srv.locate_server("/bin/sh", pack_dir=str(tmp_path), environ={})
-    with pytest.raises(ServerNotFound, match="not an executable"):
-        srv.locate_server(str(tmp_path / "moss-server"), pack_dir=str(tmp_path), environ={})
-
-
-def test_probe_hello(fake_server, monkeypatch):
-    monkeypatch.setenv("FAKE_MOSS_CAPS", "preview,release")
-    hello = srv.probe_hello(fake_server)
-    assert hello["protocol_version"] == 1
-    assert hello["capabilities"]["release"] is True
 
 
 # lifecycle --------------------------------------------------------------------------
@@ -192,36 +186,69 @@ def test_exception_in_event_handler_cancels_then_reraises(manager, fake_server, 
     assert any(m == "cancel" for m, _ in recorded(fake_env))
 
 
-def test_cancel_timeout_kills(manager, fake_server, fake_env, tmp_path):
-    fake_env["FAKE_MOSS_STEP_DELAY"] = "0.2"
+def test_silent_server_after_cancel_is_killed(manager, fake_server, fake_env, tmp_path):
     with manager.session(fake_server) as s:
         load(s, tmp_path)
         pid = manager.running.proc.pid
         with pytest.raises(MossInferError) as e:
-            s.run_job("generate", gen_params(tmp_path, prompt="IGNORE_CANCEL", steps=100),
-                      should_cancel=lambda: True, cancel_timeout=0.5)
+            s.run_job("generate", gen_params(tmp_path, prompt="HANG_ON_CANCEL", steps=100),
+                      should_cancel=lambda: True, cancel_silence=0.5)
     assert e.value.code == "cancel_timeout"
     assert manager.running is None
     with manager.session(fake_server) as s:
         assert manager.running.proc.pid != pid
 
 
-def test_busy(manager, fake_server, fake_env, tmp_path):
+def test_server_still_talking_after_cancel_is_not_killed(manager, fake_server, fake_env, tmp_path):
+    """The silence limit restarts with every event: a job that keeps reporting is waited for."""
     fake_env["FAKE_MOSS_STEP_DELAY"] = "0.05"
-    errors = []
+    with manager.session(fake_server) as s:
+        load(s, tmp_path)
+        pid = manager.running.proc.pid
+        done = s.run_job("generate", gen_params(tmp_path, prompt="IGNORE_CANCEL", steps=20),
+                         should_cancel=lambda: True, cancel_silence=0.3)  # the job lasts about 1 s
+        assert done["status"] == "ok" and manager.running.proc.pid == pid
+
+
+def test_interrupt_wins_over_cancel_timeout(manager, fake_server, tmp_path):
+    class Interrupted(BaseException):
+        pass
 
     def on_event(e):
-        if e["event"] == "progress" and e["phase"] == "denoise" and e["step"] == 1 and not errors:
-            # a second job sent straight to the process while one runs
-            try:
-                manager.running.request("generate", gen_params(tmp_path, output=str(tmp_path / "b.png")))
-            except MossInferError as err:
-                errors.append(err)
+        if e["event"] == "progress" and e["phase"] == "denoise":
+            raise Interrupted()
 
     with manager.session(fake_server) as s:
         load(s, tmp_path)
-        assert s.run_job("generate", gen_params(tmp_path, steps=4), on_event=on_event)["status"] == "ok"
-    assert errors and errors[0].code == "busy"
+        with pytest.raises(Interrupted):
+            s.run_job("generate", gen_params(tmp_path, prompt="HANG_ON_CANCEL", steps=100),
+                      on_event=on_event, cancel_silence=0.5)
+    assert manager.running is None  # killed all the same
+
+
+def test_bad_lines_do_not_stop_the_reader(manager, fake_server, tmp_path):
+    with manager.session(fake_server) as s:
+        load(s, tmp_path)
+        assert s.run_job("generate", gen_params(tmp_path, prompt="BAD_LINES"))["status"] == "ok"
+        assert s.request("status")["state"] == "idle"
+
+
+def test_busy_from_the_server(manager, fake_server, fake_env, tmp_path):
+    """A `busy` answer (another client of the same process holds a job) is an error for this
+    job only: the process stays, and the next job runs once the other ends."""
+    fake_env["FAKE_MOSS_STEP_DELAY"] = "0.05"
+    with manager.session(fake_server) as s:
+        load(s, tmp_path)
+        proc = manager.running
+        other = proc.next_id("other")
+        proc.request("generate", gen_params(tmp_path, steps=6, output=str(tmp_path / "other.png")), req_id=other)
+        with pytest.raises(MossInferError) as e:
+            s.run_job("generate", gen_params(tmp_path))
+        assert e.value.code == "busy"
+        assert manager.running is proc
+        while s.request("status")["state"] != "idle":
+            time.sleep(0.02)
+        assert s.run_job("generate", gen_params(tmp_path))["status"] == "ok"
 
 
 def test_session_lock_serializes_jobs(manager, fake_server, fake_env, tmp_path):
@@ -310,6 +337,43 @@ def test_capability_gating_release(tmp_path, fake_server, fake_env):
         new.shutdown()
 
 
+@pytest.fixture
+def release_manager(tmp_path, fake_env):
+    env = dict(fake_env, FAKE_MOSS_CAPS="preview,release", FAKE_MOSS_RELEASE_DELAY="5")
+    m = ServerManager(log_dir=str(tmp_path / "r"), env=env)
+    yield m
+    m.shutdown()
+
+
+def test_release_can_be_cancelled(release_manager, fake_server, tmp_path):
+    with release_manager.session(fake_server) as s:
+        load(s, tmp_path)
+        t0 = time.monotonic()
+        r = s.release(should_cancel=lambda: time.monotonic() - t0 > 0.2)
+        assert r["cancelled"] is True and r["vram_released_bytes"] == 0
+        assert time.monotonic() - t0 < 3
+        assert s.request("status")["state"] == "idle"
+
+
+def test_release_has_a_finite_timeout(release_manager, fake_server, tmp_path):
+    with release_manager.session(fake_server) as s:
+        load(s, tmp_path)
+        with pytest.raises(MossInferError) as e:
+            s.release(timeout=0.3)
+    assert e.value.code == "timeout"
+    assert release_manager.running is None  # a server that does not answer is killed
+
+
+def test_replaced_model_file_loads_again(manager, fake_server, fake_env, tmp_path):
+    params = {"model": str(tmp_path / "bundle"), "mode": "balanced"}
+    (tmp_path / "bundle").mkdir()
+    with manager.session(fake_server) as s:
+        assert s.ensure_loaded(params, stamp=[("/d.safetensors", 1, 10)]) is True
+        assert s.ensure_loaded(params, stamp=[("/d.safetensors", 1, 10)]) is False
+        assert s.ensure_loaded(params, stamp=[("/d.safetensors", 2, 10)]) is True
+    assert [m for m, _ in recorded(fake_env)].count("load") == 2
+
+
 def test_unload_then_load_again(manager, fake_server, fake_env, tmp_path):
     with manager.session(fake_server) as s:
         load(s, tmp_path)
@@ -318,13 +382,46 @@ def test_unload_then_load_again(manager, fake_server, fake_env, tmp_path):
     assert [m for m, _ in recorded(fake_env)].count("load") == 2
 
 
-def test_protocol_mismatch(tmp_path, fake_server, fake_env):
-    m = ServerManager(log_dir=str(tmp_path / "l"), env=dict(fake_env, FAKE_MOSS_PROTOCOL="2"))
+@pytest.mark.parametrize("var,value,word", [("FAKE_MOSS_PROTOCOL", "2", "unsupported protocol"), ("FAKE_MOSS_ABI", "2", "ABI 2")])
+def test_protocol_or_abi_mismatch(tmp_path, fake_server, fake_env, var, value, word):
+    m = ServerManager(log_dir=str(tmp_path / "l"), env=dict(fake_env, **{var: value}))
     with pytest.raises(MossInferError) as e:
         with m.session(fake_server):
             pass
-    assert e.value.code == "unsupported_protocol"
+    assert e.value.code == "unsupported_protocol" and word in str(e.value)
     assert m.running is None
+
+
+def test_log_tail_quotes_only_the_current_process(manager, fake_server, tmp_path):
+    os.makedirs(manager.log_dir)
+    with open(manager.log_path, "w") as f:
+        f.write("an old line from an earlier process\n")
+    manager._log_rotated = True  # keep the old line in the same file
+    with manager.session(fake_server) as s:
+        load(s, tmp_path)
+        with pytest.raises(ServerCrashed) as e:
+            s.run_job("generate", gen_params(tmp_path, prompt="CRASH", steps=6))
+    assert "simulated fault" in str(e.value) and "earlier process" not in str(e.value)
+
+
+def test_spawn_failure_closes_the_log(tmp_path, monkeypatch):
+    opened = []
+    real_open = open
+
+    def tracking_open(*a, **kw):
+        f = real_open(*a, **kw)
+        opened.append(f)
+        return f
+
+    monkeypatch.setattr("builtins.open", tracking_open)
+    bad = tmp_path / "moss-server"
+    bad.write_text("not a program")
+    bad.chmod(0o755)
+    m = ServerManager(log_dir=str(tmp_path / "l"))
+    with pytest.raises(ServerNotFound):
+        with m.session(str(bad)):
+            pass
+    assert opened and all(f.closed for f in opened)
 
 
 def test_server_path_change_replaces_process(manager, fake_server, tmp_path):
