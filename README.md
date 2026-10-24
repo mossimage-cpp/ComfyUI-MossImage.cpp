@@ -20,8 +20,8 @@ The engine is not a ComfyUI model. Its nodes do not produce or take ComfyUI's `M
 | Image input | img2img from an `IMAGE` with a denoise strength, inpainting with a `MASK`, crop / fit / stretch resizing |
 | Hires fix | a second pass at a larger size, with its own strength and steps |
 | LoRAs | any number, chained, each with a strength: kohya, PEFT / diffusers, LyCORIS LoHa and LoKr, full deltas |
-| Control adapters | a control adapter file (e.g. the MOSS-Image color / depth control) with one conditioning image per kind, each with a strength and a step window |
-| Lossy accelerators | CFG truncation and the First-Block step cache, off by default |
+| Control adapters | a control adapter file (e.g. the MOSS-Image color / depth control) with one conditioning image per kind, each with a strength and a step window (servers with the `control` capability: MossInfer 1.1 and later) |
+| Lossy accelerators | CFG truncation and the First-Block step cache, off by default (servers with the `accel` capability: MossInfer 1.1 and later) |
 | Quality tiers | `auto`, `reference`, `high`, `turbo` (INT4 DiT files only), and the attention override |
 | Memory modes | `balanced`, `min_memory`, `max_speed` |
 | Progress | the node's progress bar and status text (the result and the engine's warnings are shown on the node when it ends); latent previews on the node while sampling, following ComfyUI's preview method |
