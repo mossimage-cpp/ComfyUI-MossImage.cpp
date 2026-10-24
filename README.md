@@ -4,7 +4,7 @@ ComfyUI nodes that run MOSS-Image (the 5B DiT with the Qwen3.5-9B text encoder a
 
 The engine runs as its own process, `moss-server`, which the pack starts and talks to over pipes (JSON lines). This has three consequences:
 - **Crash isolation.** A CUDA fault ends `moss-server`, not ComfyUI. The pack starts a new one for the next run.
-- **No fight over VRAM.** owoinfer plans its own GPU memory, outside torch's caching allocator. By default the Generate node first unloads ComfyUI's own models.
+- **Separate memory management.** owoinfer plans its own GPU memory, outside torch's caching allocator, so the two never share an allocator. They still share the GPU: by default the Generate node first unloads ComfyUI's own models, and ComfyUI's memory manager cannot see what the engine holds (see "Sharing the GPU").
 - **One engine, shared by every node.** There is one `moss-server` per ComfyUI process. It is reused across runs, loads a model only when the loader's settings change, and runs one job at a time. ComfyUI stops it on exit.
 
 The engine is not a ComfyUI model. Its nodes do not produce or take ComfyUI's `MODEL`, `CLIP`, `VAE` or `LATENT`, and they do not work with KSampler. The input is a prompt and optional images, and the output is an `IMAGE`.
@@ -24,12 +24,12 @@ The engine is not a ComfyUI model. Its nodes do not produce or take ComfyUI's `M
 | Lossy accelerators | CFG truncation and the First-Block step cache, off by default |
 | Quality tiers | `auto`, `reference`, `high`, `turbo` (INT4 DiT files only), and the attention override |
 | Memory modes | `balanced`, `min_memory`, `max_speed` |
-| Progress | the node's progress bar and status text; latent previews on the node while sampling; overall progress and ETA from servers that report them |
+| Progress | the node's progress bar and status text (the result and the engine's warnings are shown on the node when it ends); latent previews on the node while sampling, following ComfyUI's preview method |
 | Cancel | ComfyUI's Cancel stops the engine within one layer or block |
-| After a run | keep the model in VRAM, release the VRAM and keep the weights in RAM (servers with `release`), or unload |
-| Platforms | wherever owoinfer runs: Linux x86-64 and Windows x64, NVIDIA compute capability 8.x and 12.x (RTX 30, 40 and 50 series, A100, A10, A40, L4, L40, RTX PRO Blackwell). The pack itself is tested on Linux. |
+| After a run | keep the model in VRAM, release the VRAM and keep the weights in RAM (servers with the `release` capability: MossInfer 1.1 and later), or unload |
+| Platforms | Linux x86-64 with NVIDIA compute capability 8.x and 12.x (RTX 30, 40 and 50 series, A100, A10, A40, L4, L40, RTX PRO Blackwell). Windows x64: written for, untested. |
 
-The nodes adapt to the `moss-server` they find. They ask it for its capabilities and offer only what it supports: for example, `after_run` lists `release` only with a server that has it. A setting the server lacks is refused with a message that names the capability, rather than sent anyway.
+The nodes adapt to the `moss-server` they find. When a run starts, they ask it for its capabilities. A setting the server lacks (for example `after_run` `release` on a 1.0 server) is refused with a message that names the capability, rather than sent anyway. Nothing starts `moss-server` before the first run.
 
 ## Planned
 
@@ -37,6 +37,7 @@ The nodes adapt to the `moss-server` they find. They ask it for its capabilities
 |---|---|
 | Distill bundles and the `dataspace` sampler | the engine supports them; the pack needs a bundle-folder picker on the loader and on Generate, and "unset" steps / CFG |
 | Preload when the model is selected | the engine's `preload` (servers with that capability); the pack does not send it yet |
+| Overall progress and ETA | coded against the `progress_fraction` capability, which no MossInfer release has yet; until then the bar follows the denoise steps |
 | More engine settings on the loader | VRAM budget and reserve, GPU index, LoRA strictness, text-encoder pinning, extra certificate folders, DiT read mode |
 | A model folder made of small files only | needs an engine change (see "Model files") |
 
@@ -58,6 +59,7 @@ The nodes adapt to the `moss-server` they find. They ask it for its capabilities
 1. Put this folder in `ComfyUI/custom_nodes/`, as `ComfyUI/custom_nodes/ComfyUI-MossImage-owoinfer`. It needs nothing beyond what ComfyUI already has (torch, numpy, Pillow).
 2. Give it a `moss-server`. Download a MossInfer release for your OS and extract it into the pack's `bin/` folder:
    ```sh
+   mkdir -p ComfyUI/custom_nodes/ComfyUI-MossImage-owoinfer/bin
    tar -xzf mossinfer-<version>-linux-cu13-x86_64.tar.gz -C ComfyUI/custom_nodes/ComfyUI-MossImage-owoinfer/bin/
    ```
    On Windows, extract the `.zip` into `bin\` the same way. Keep the archive's `bin/` and `lib/` together, because `moss-server` loads the engine library from `../lib`.
@@ -65,21 +67,22 @@ The nodes adapt to the `moss-server` they find. They ask it for its capabilities
 3. Restart ComfyUI. The nodes are under **MOSS-Image (owoinfer)**.
 
 **Where the pack looks for `moss-server`**, in this order:
-1. the loader's `server_path` setting, when set;
-2. the `MOSSINFER_SERVER` environment variable;
-3. `bin/moss-server` in the pack, or `bin/*/bin/moss-server` (a release archive extracted into `bin/`);
-4. `PATH`.
+1. the `MOSSINFER_SERVER` environment variable, set where ComfyUI is started;
+2. `bin/moss-server` in the pack, or `bin/*/bin/moss-server` (a release archive extracted into `bin/`; the newest version first);
+3. `PATH`.
 
-If none is found, the error names all of these places.
+If none is found, the error names all of these places. A workflow cannot choose the program (see "Security notes").
 
 ## Model files
 
 **The model is a bundle folder, and it must be complete.** Download the official folder from Hugging Face into `ComfyUI/models/moss_image/`:
 
 ```sh
-hf download OpenMOSS-Team/MOSS-Image-SFT --local-dir ComfyUI/models/moss_image/MOSS-Image-SFT --exclude 'assets/*'
-hf download OpenMOSS-Team/MOSS-Image-Base --local-dir ComfyUI/models/moss_image/MOSS-Image-Base --exclude 'assets/*'
+hf download OpenMOSS-Team/MOSS-Image-SFT  --revision 2c7954437269461767f533b006823e8f85973a60 --local-dir ComfyUI/models/moss_image/MOSS-Image-SFT --exclude 'assets/*'
+hf download OpenMOSS-Team/MOSS-Image-Base --revision 32edbc8a53ff3117ed52af34ce27a031129f2d0e --local-dir ComfyUI/models/moss_image/MOSS-Image-Base --exclude 'assets/*'
 ```
+
+These are the revisions MossInfer was tested with.
 
 A folder is listed by the loader when it holds `tokenizer/` and `transformer/config.json`, `text_encoder/config.json` and `vae/config.json`, up to three levels below `models/moss_image/`. Each folder is about 27 GB. To save disk with both models, hard-link SFT's `text_encoder/*.safetensors` and `vae/*.safetensors` to Base's: they are byte-identical.
 
@@ -95,7 +98,7 @@ A folder is listed by the loader when it holds `tokenizer/` and `transformer/con
 Be precise about what the engine needs:
 - **The folder is still required in full.** The tokenizer and configs always come from it. owoinfer also reads the folder's own weight files (`transformer/`, `text_encoder/`, `vae/`) when it indexes the model, even when component files replace all three. A folder with only the configs and tokenizer (no large `.safetensors` files) is refused at the first generation with a `model` error, e.g. `…/text_encoder: expected one .safetensors file or a shard index, found 0 files and no index`. So ComfyUI users cannot yet get by with the small files of the folder plus Comfy component files.
 - **A single file as the model is refused** (`not_supported`). The loader therefore picks a folder, never a file.
-- **INT4 DiT files run only under tier `turbo`, and `turbo` runs only INT4 files.** The loader checks the file's header: with an INT4 file, `auto` becomes `turbo`; `turbo` with any other DiT, or `reference` / `high` with an INT4 file, is refused before the engine starts. `reference` with an INT8 file is refused by the engine, with a message that names the conflict.
+- **INT4 DiT files need tier `turbo`, chosen explicitly, and `turbo` runs only INT4 files.** Turbo is lossy and uncertified, so the pack never picks it for you. The loader reads the DiT file's header when the workflow is queued. An INT4 file with tier `auto` is refused with `INT4 DiT file: choose tier turbo (lossy, uncertified)`, and `turbo` with an INT8, bf16, FP8 or NVFP4 DiT (or the folder's own) is refused too. Any other combination goes to the engine as chosen, and the engine refuses what it does not run (e.g. `reference` with an INT8 file) with a message that names the conflict.
 - **Wrong files are refused by the engine** at the first generation, with a message that names the file and what was found (another model, GGUF, FP8 and so on).
 
 **Other model folders.** `models/moss_image` is a regular ComfyUI model folder, so `extra_model_paths.yaml` can add more:
@@ -120,9 +123,10 @@ A plain description of the model: the engine is global, and loads it on the firs
 | `model_folder` | the bundle folders found under `models/moss_image/` |
 | `dit_file`, `text_encoder_file`, `vae_file` | `(from folder)` (default) or a file from `diffusion_models`, `text_encoders`, `vae` |
 | `mode` | `balanced` (default), `min_memory`, `max_speed` |
-| `tier` | `auto` (default), `reference`, `high`, `turbo` |
+| `tier` | `auto` (default), `reference`, `high`, `turbo` (INT4 DiT files only, which need it) |
 | `attention` (advanced) | `default` (the tier's choice), `exact`, `q8_fp16`, `q8_fp16_f32acc`, `q8_fp8`, `q8_fp8_f32acc` |
-| `server_path` (advanced) | another `moss-server` binary; empty uses the search order above |
+
+Replacing a model file (same name, new contents) makes the loader run again, and the engine load the new file.
 
 ### MOSS-Image LoRA: `MOSS_MODEL` → `MOSS_MODEL`
 
@@ -130,7 +134,7 @@ A plain description of the model: the engine is global, and loads it on the firs
 
 ### MOSS-Image Control → `MOSS_CONTROL`
 
-`adapter` (from `models/loras/`), `kind` (one of the adapter's kinds, e.g. `depth` or `color`), `image`, `strength` (0 to 10), `start` and `end` (the share of the steps it is active in), `lora_strength` (the adapter's LoRA part), and an optional `control` to chain another kind for the same adapter. Connect the last one to Generate's `control`. A run with a control adapter is uncertified.
+`adapter` (from `models/loras/`), `kind` (one of the adapter's kinds, e.g. `depth` or `color`), `image`, `strength` (0 to 10), `start` and `end` (the share of the steps it is active in), `lora_strength` (the adapter's LoRA part; the same on every node of a chain), and an optional `control` to chain another kind for the same adapter. Connect the last one to Generate's `control`. A run with a control adapter is uncertified.
 
 ### MOSS-Image Generate → `IMAGE`
 
@@ -150,11 +154,17 @@ A plain description of the model: the engine is global, and loads it on the firs
 | advanced: `uncond_skip_layers`, `slg_layers`, `slg_scale`, `slg_start`, `slg_stop`, `max_sequence_length`, `flow_multiplier`, `noise_layout`, `noise_source`, `eta`, `s_noise` | the engine's | |
 | advanced: `hires_width`, `hires_height`, `hires_strength`, `hires_steps` | 0, 0, 0.45, 0 | hires fix; 0 × 0 is off, `hires_steps` 0 uses `steps` |
 | advanced: `cfg_truncation`, `step_cache`, `step_cache_threshold` | 1, `off`, 0 | lossy accelerators; a threshold of 0 uses the engine's default |
-| advanced: `preview` | on | latent previews on the node |
-| advanced: `after_run` | `keep` | `keep`, `release` (servers with `release`: VRAM freed, weights kept in RAM for a fast reload), `unload` |
+| advanced: `preview` | on | latent previews on the node, unless ComfyUI's preview method is `none` |
+| advanced: `after_run` | `keep` | `keep`, `release` (servers with `release`: VRAM freed, weights kept in RAM for a fast reload; Cancel stops it), `unload` |
 | advanced: `free_comfy_vram` | on | unload ComfyUI's own models before the run |
 
-The engine checks the values itself. When it refuses one, ComfyUI shows its message as it is, e.g. `Height and width must be positive multiples of 16.` Engine warnings (a truncated prompt, LoRA layers it could not apply exactly, lossy accelerators) appear in ComfyUI's console log.
+The engine checks the values itself. When it refuses one, ComfyUI shows its message as it is, e.g. `Height and width must be positive multiples of 16.` Engine warnings (a truncated prompt, LoRA layers it could not apply exactly, lossy accelerators) appear on the node and in ComfyUI's console log. A batch on `init_image`, `mask` or a Control `image` uses its first item, with a warning in the log.
+
+## Sharing the GPU
+
+- **With ComfyUI's own models.** With `after_run` `keep`, the engine keeps the model in VRAM after the run, and ComfyUI's memory manager cannot see that memory. A torch-heavy node later in the workflow (an upscaler, another model) can then run out of VRAM. Set `after_run` to `release` (or `unload` on servers without `release`) on the last Generate before such nodes. `free_comfy_vram` covers the other direction: ComfyUI's models leave VRAM before the engine runs.
+- **With another engine user.** Two ComfyUI instances on one GPU, or ComfyUI and another owoinfer application such as MossStudio, each run their own engine. Each engine plans against the VRAM that is free when it plans, so the other can push it into running out of memory, or into more streaming (slower). Run one instance per GPU, or use `min_memory` mode and `after_run` `release` in each.
+- **The cache folder is shared safely.** Several `moss-server` processes, of any engine version, can use the same cache folder at once: they write it atomically, and they share the prompt-embedding hits.
 
 ## Example workflow
 
@@ -170,7 +180,7 @@ The engine checks the values itself. When it refuses one, ComfyUI shows its mess
 
 - `moss-server` reads and writes the paths it is given. The pack sends only paths it chose itself: files from ComfyUI's model folders and temp PNGs it wrote.
 - Images reach the engine only as PNGs that the pack encodes from ComfyUI tensors. The engine's own image decoder never sees an uploaded or downloaded file.
-- `server_path` comes from the workflow, so it must name a file called `moss-server` (`moss-server.exe` on Windows). A shared workflow cannot make ComfyUI run another program.
+- The program that runs is chosen only by the person who starts ComfyUI: the `MOSSINFER_SERVER` environment variable, the pack's `bin/` folder, or `PATH`. No workflow value and no file under ComfyUI's `user/` folder (which ComfyUI's web API can write) takes part.
 
 ## Tests
 
@@ -181,7 +191,7 @@ python -m pytest tests                      # unit tests and the headless ComfyU
 OWOINFER_GPU_TESTS=1 python -m pytest tests # also the GPU smoke tests with a real moss-server (MOSS_SERVER=...)
 ```
 
-The e2e tests start ComfyUI from `COMFYUI_DIR` (its code and venv) with a scratch base directory and `--cpu`, and change nothing in that install.
+The e2e tests start ComfyUI from `COMFYUI_DIR` (its code and venv) with a scratch base directory, `--cpu`, and a database in that scratch directory, with bytecode writing off; a test checks that nothing in the install changed. ComfyUI always reads `<install>/extra_model_paths.yaml` when it exists (there is no option to skip it), so its folders show up in the tests too; the tests warn when the file exists.
 
 ## License
 
