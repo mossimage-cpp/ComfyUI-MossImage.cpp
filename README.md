@@ -8,7 +8,8 @@ The engine runs as its own process, `moss-server`, which the pack starts at the 
 
 ComfyUI runs MOSS-Image natively, and if that works well for you, there is no need for this pack. Use it when:
 
-- **VRAM is tight.** owoinfer plans its memory against the GPU it finds and streams the model from RAM or disk when it does not fit, instead of failing. It targets cards with 8 GiB of VRAM or more.
+- **VRAM is tight.** owoinfer plans its memory against the GPU it finds and streams the model from RAM or disk when it does not fit, instead of failing. It targets cards with 8 GiB of VRAM or more. On an RTX 5090 its peak was 0.36–0.66× of ComfyUI's (see [Performance](#performance)).
+- **You want it somewhat faster.** With the same files and the same kind of attention, it was 1.04–1.21× as fast as ComfyUI on an RTX 5090. INT8 at 2048² gets there only with `attention` set to `q8_fp8` (see [Performance](#performance)).
 - **You want crash isolation.** A CUDA fault ends `moss-server`, not ComfyUI; the next run starts a new one.
 - **You want the official pipeline.** The `moss` scheduler with the `euler` sampler reproduces the official MOSS-Image pipeline bit for bit.
 
@@ -30,6 +31,35 @@ The cost is that the nodes are a closed pipeline. You can't mix them with ComfyU
 The nodes ask the `moss-server` they find what it supports. A setting it lacks is refused with a message that names it, rather than sent anyway. With MossInfer 1.1, two more checks run before anything loads:
 - **Files:** the engine inspects each model file the run uses (DiT, text encoder, VAE, LoRAs, control adapter) and says what it is. A file in the wrong slot, a LoRA the engine can't use, a tier the DiT doesn't run, or a control `kind` the adapter doesn't have stops the run with the engine's reason. Results are kept per file until the file or the engine changes.
 - **Names:** the sampler, scheduler, attention, mode, tier and the other choices are checked against the names the server accepts, so an older server that lacks one says so and lists what it has.
+
+## Performance
+
+One benchmark run against ComfyUI's native MOSS-Image support, on 2026-10-24/25:
+
+- **GPU:** RTX 5090 (a rental) at its 575 W power cap.
+- **ComfyUI:** 0.42.0 (`7cebca5`), torch 2.14.1+cu130, comfy-kitchen 0.2.40, SageAttention 2.2.0. The official `image_moss_image_t2i` template.
+- **owoinfer:** MossInfer `920bcf5` through `moss-server`, mode `balanced`.
+- **Files:** the same Comfy-Org DiT files (`moss_image_sft_bf16`, `moss_image_sft_int8_convrot`) and `flux2-vae` on both sides.
+- **Run:** text to image, 50 steps, CFG 3. Time is the median of 3 warm runs (models loaded), from the request to the written PNG. VRAM is the process's peak in `nvidia-smi`.
+
+| Size | DiT | Attention: ComfyUI / owoinfer | ComfyUI | owoinfer | Speed-up | Peak VRAM: ComfyUI / owoinfer |
+|---|---|---|---|---|---|---|
+| 1024² | bf16 | exact: default (SDPA) / tier `auto` | 27.66 s | 23.09 s | 1.20× | 25.9 / 12.2 GiB |
+| 1024² | bf16 | 8-bit: `--use-sage-attention` / tier `high` | 25.29 s | 20.96 s | 1.21× | 25.9 / 12.2 GiB |
+| 1024² | INT8 | 8-bit: default (comfy-kitchen INT8) / tier `auto` | 10.87 s | 9.86 s | 1.10× | 21.5 / 7.8 GiB |
+| 2048² | bf16 | exact: default (SDPA) / tier `auto` | 162.10 s | 136.43 s | 1.19× | 28.0 / 18.4 GiB |
+| 2048² | bf16 | 8-bit: `--use-sage-attention` / tier `high` | 122.68 s | 101.44 s | 1.21× | 28.0 / 18.4 GiB |
+| 2048² | INT8 | 8-bit: default (comfy-kitchen INT8) / `attention` `q8_fp8` | 61.88 s | 59.71 s | 1.04× | 23.6 / 13.9 GiB |
+| 2048² | INT8 | 8-bit: default (comfy-kitchen INT8) / tier `auto` (exact) | 61.88 s | 93.74 s | 0.66× | 23.6 / 13.9 GiB |
+
+Speed-up is ComfyUI's time divided by owoinfer's.
+
+- **Speed:** with the same kind of attention, owoinfer was 1.19–1.21× as fast with bf16 weights and 1.04–1.10× with INT8.
+- **VRAM:** owoinfer's peak was 0.36–0.66× of ComfyUI's. Part of ComfyUI's figure is cache, not a requirement: its dynamic VRAM keeps the text encoder resident.
+- **INT8 at 2048² with tier `auto` is slower than ComfyUI** (93.7 s vs 61.9 s). owoinfer's quality certificates cover images up to about 1450², so above that `auto` uses exact attention. Set the loader's `attention` to `q8_fp8` for 59.7 s; at that size it runs uncertified.
+- **bf16 with tier `auto`:** in `920bcf5` no certificate covered Comfy-Org's bf16 file, so `auto` ran exact attention. The tier `high` rows are the 8-bit speed.
+- **The samplers differ:** ComfyUI ran the template's `er_sde` + `simple`, owoinfer its default `euler` + `moss`. Both make the same number of model evaluations per step.
+- **Scope:** one card, one rental. Other GPUs and the INT4 and NVFP4 files haven't been compared.
 
 ## Requirements
 
