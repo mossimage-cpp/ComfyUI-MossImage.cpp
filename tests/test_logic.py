@@ -129,8 +129,12 @@ def test_tier_problem():
     assert logic.tier_problem("auto", "int4") == "INT4 DiT file: choose tier turbo (lossy, uncertified)"
     assert logic.tier_problem("high", "int4") == ""  # the engine decides
     assert "not the folder's own DiT" in logic.tier_problem("turbo", None)
-    for kind in ("int8", "bf16", "fp8", "nvfp4"):
+    for kind in ("int8", "bf16", "fp8"):
         assert f"not this DiT file ({kind})" in logic.tier_problem("turbo", kind)
+    # NVFP4 (MossInfer 1.1, RTX 50) follows INT4's policy; the engine decides whether it runs here
+    assert logic.tier_problem("turbo", "nvfp4") == ""
+    assert logic.tier_problem("auto", "nvfp4") == "NVFP4 DiT file: choose tier turbo (lossy, uncertified)"
+    assert logic.tier_problem("auto", "nvfp4", has_certificate=True) == ""
     assert logic.tier_problem("turbo", "unknown") == ""  # a file the pack cannot read goes to the engine
     # an INT4 file with its own sidecar certificate: the engine decides what auto runs
     assert logic.tier_problem("auto", "int4", has_certificate=True) == ""

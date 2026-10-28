@@ -157,7 +157,7 @@ def test_int4_dit_with_auto_is_refused_before_running(comfy):
         comfy.queue(prompt)
     assert "INT4 DiT file: choose tier turbo (lossy, uncertified)" in str(e.value)
     prompt = loader(small(load_workflow_prompt(comfy), seed=24), tier="turbo")  # the folder's bf16 DiT
-    with pytest.raises(RuntimeError, match="tier turbo runs only an INT4 DiT file"):
+    with pytest.raises(RuntimeError, match="tier turbo runs only an INT4 or NVFP4 DiT file"):
         comfy.queue(prompt)
     prompt = loader(small(load_workflow_prompt(comfy), seed=24), dit_file="nope.safetensors")
     with pytest.raises(RuntimeError, match="dit_file not found"):  # the combo check validate_inputs repeats

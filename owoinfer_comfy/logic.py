@@ -192,7 +192,8 @@ def dit_quant_kind(path: str) -> str:
     return "unknown"
 
 
-NOT_INT4 = {"int8", "bf16", "fp8", "nvfp4"}
+TURBO_ONLY = {"int4", "nvfp4"}  # 4-bit DiT files: turbo runs them, auto needs a certificate
+NOT_TURBO = {"int8", "bf16", "fp8"}
 CERT_SIDECAR = ".mossinfer-cert.json"  # <dit>.mossinfer-cert.json: the DiT's own quality certificate
 
 
@@ -200,17 +201,18 @@ def tier_problem(tier: str, dit_kind: str | None, has_certificate: bool = False)
     """Why `tier` cannot run this DiT, or "". The tier itself is always sent unchanged.
 
     `dit_kind` is dit_quant_kind() of the DiT file, None for the folder's own (bf16) DiT.
-    Turbo is chosen explicitly and runs only an INT4 DiT; `auto` refuses an uncertified
-    INT4 DiT (integration.md, "Model files"). An "unknown" file goes to the engine,
-    which decides. So does an INT4 file with a sidecar certificate (`has_certificate`):
-    a certificate can let `auto` run it. Certificates in the other places the engine
+    Turbo is chosen explicitly and runs only a 4-bit DiT (INT4, or NVFP4 from MossInfer 1.1
+    on RTX 50 GPUs); `auto` refuses an uncertified 4-bit DiT (integration.md, "Model files").
+    Whether this GPU and engine build run NVFP4 at all is the engine's call. An "unknown"
+    file goes to the engine, which decides. So does a 4-bit file with a sidecar certificate
+    (`has_certificate`): a certificate can let `auto` run it. Certificates in the other places the engine
     searches (certificate_dirs, the cache folder, the package) are not looked at here.
     """
-    if dit_kind == "int4" and tier == "auto" and not has_certificate:
-        return "INT4 DiT file: choose tier turbo (lossy, uncertified)"
-    if tier == "turbo" and (dit_kind is None or dit_kind in NOT_INT4):
+    if dit_kind in TURBO_ONLY and tier == "auto" and not has_certificate:
+        return f"{dit_kind.upper()} DiT file: choose tier turbo (lossy, uncertified)"
+    if tier == "turbo" and (dit_kind is None or dit_kind in NOT_TURBO):
         what = "the folder's own DiT (bf16)" if dit_kind is None else f"this DiT file ({dit_kind})"
-        return f"tier turbo runs only an INT4 DiT file, not {what}"
+        return f"tier turbo runs only an INT4 or NVFP4 DiT file, not {what}"
     return ""
 
 

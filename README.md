@@ -23,7 +23,7 @@ The cost is that the nodes are a closed pipeline. You can't mix them with ComfyU
 - **Models:** MOSS-Image Base and SFT folders, fine-tunes with the same architecture, and single-file DiT, text encoder and VAE files, such as the Comfy-Org INT8 ConvRot files.
 - **LoRAs:** any number, chained. Formats: kohya, PEFT / diffusers, LyCORIS LoHa and LoKr, and full deltas.
 - **Control adapters**, such as the colour/depth control, and the lossy accelerators (CFG truncation, First-Block cache). Both need MossInfer 1.1 or later, and runs that use either are uncertified.
-- **Quality tiers** (`auto`, `reference`, `high`, `turbo` for INT4 files) and **memory modes** (`balanced`, `min_memory`, `max_speed`).
+- **Quality tiers** (`auto`, `reference`, `high`, `turbo` for INT4 and NVFP4 files) and **memory modes** (`balanced`, `min_memory`, `max_speed`).
 - Progress bar, latent previews (off when ComfyUI's preview method is `none`) and the engine's warnings on the node. With MossInfer 1.1 the bar covers the whole run (text encoder and model loads included) and the node shows the time remaining; with 1.0 it follows the sampling steps. ComfyUI's Cancel stops a run within one layer or block.
 - **After a run:** keep the model in VRAM, release the VRAM and keep the weights in RAM (MossInfer 1.1 and later), or unload it.
 
@@ -125,7 +125,7 @@ Load `example_workflows/MOSS-Image_txt2img.json` (Model Loader → Generate → 
 | `model_folder` | the folders found under `models/moss_image/` |
 | `dit_file`, `text_encoder_file`, `vae_file` | `(from folder)` (default), or a file from `diffusion_models`, `text_encoders`, `vae` |
 | `mode` | `balanced` (default), `min_memory`, `max_speed` |
-| `tier` | `auto` (default), `reference`, `high`, `turbo` (INT4 DiT files only) |
+| `tier` | `auto` (default), `reference`, `high`, `turbo` (INT4 and NVFP4 DiT files only) |
 | `attention` (advanced) | `default` (the tier's choice), `exact`, `q8_fp16`, `q8_fp16_f32acc`, `q8_fp8`, `q8_fp8_f32acc` |
 
 The loader only describes the model; the engine loads it at the first run. A model file replaced under the same name makes the loader run again, and the engine loads the new file.
@@ -172,7 +172,7 @@ The engine checks the values itself. When it refuses one, ComfyUI shows its mess
 
 - **The model folder is required in full.** The engine reads the folder's weight files even when single files replace all three parts, so a folder with only the configs and tokenizer is refused at the first run, e.g. `…/text_encoder: expected one .safetensors file or a shard index, found 0 files and no index`.
 - **A single checkpoint file can't be the model.** The loader picks a folder; ComfyUI files load next to it.
-- **INT4 DiT files need tier `turbo`, chosen by you.** Turbo is lossy and uncertified, so the pack never picks it. When you queue the workflow, an INT4 file with `auto` is refused with `INT4 DiT file: choose tier turbo (lossy, uncertified)` (unless the file has its own `<file>.mossinfer-cert.json` certificate), and `turbo` with an INT8, bf16, FP8 or NVFP4 DiT, or the folder's own, is refused too. With MossInfer 1.1, any other tier the DiT doesn't run (e.g. `reference` with an INT8 file, `high` with an INT4 one) is refused before the run loads anything, with the engine's reason; with 1.0, the engine refuses it at the first run.
+- **INT4 and NVFP4 DiT files need tier `turbo`, chosen by you.** Turbo is lossy and uncertified, so the pack never picks it. When you queue the workflow, an INT4 or NVFP4 file with `auto` is refused with e.g. `INT4 DiT file: choose tier turbo (lossy, uncertified)` (unless the file has its own `<file>.mossinfer-cert.json` certificate), and `turbo` with an INT8, bf16 or FP8 DiT, or the folder's own, is refused too. With MossInfer 1.1, any other tier the DiT doesn't run (e.g. `reference` with an INT8 file, `high` with an INT4 one) is refused before the run loads anything, with the engine's reason; with 1.0, the engine refuses it at the first run.
 - **One image per run, one run at a time.** A batch on `init_image`, `mask` or a Control `image` uses its first item, with a warning. ComfyUI's queue runs generations in turn.
 - **Not with ComfyUI's model nodes:** no `MODEL` / `CLIP` / `VAE` / `LATENT`, no KSampler, no ComfyUI LoRA loaders.
 - **Formats the engine does not read:**
@@ -180,7 +180,7 @@ The engine checks the values itself. When it refuses one, ComfyUI shows its mess
   - FP8 (`fp8_scaled`, `float8_e4m3fn`);
   - torchao, MLX and SDNQ;
   - `.bin` / `.pt` files;
-  - NVFP4 DiT files (not in this engine version).
+  - NVFP4 DiT files before MossInfer 1.1, or on GPUs without FP4 tensor cores (1.1 runs them on RTX 50 series cards, tier `turbo`).
 
   The engine refuses them with a message that names what it found.
 - **No image editing models** (MOSS-Image-Edit and similar): the engine has no reference-image input.

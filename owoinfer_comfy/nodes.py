@@ -96,7 +96,7 @@ class ModelLoader(io.ComfyNode):
                                        "other apps; max_speed uses the RAM it can."),
                 io.Combo.Input("tier", options=logic.TIERS, default="auto",
                                tooltip="Quality tier. auto picks the fastest certified configuration. "
-                                       "turbo (lossy, uncertified) is for INT4 DiT files only, and they need it."),
+                                       "turbo (lossy, uncertified) is for INT4 and NVFP4 DiT files only, and they need it."),
                 io.Combo.Input("attention", options=logic.ATTENTIONS, default="default", advanced=True,
                                tooltip="Overrides the tier's attention: exact or an 8-bit mode."),
             ],
