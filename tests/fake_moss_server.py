@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""A fake moss-server for tests: protocol 1 over stdin/stdout, no GPU.
+"""A fake moss-server for tests: protocol 2 over stdin/stdout, no GPU.
 
 Modelled on MossStudio's tools/fake-moss-server.mjs, extended to what the node
 pack uses: capabilities from the environment, previews, progress fractions,
 preload/release, and failure modes chosen by the prompt.
 
 Environment:
-  FAKE_MOSS_CAPS        comma-separated capabilities that are true (default: a 1.0.0 build)
-  FAKE_MOSS_VERSION     the version in hello (default 1.0.0)
-  FAKE_MOSS_PROTOCOL    the protocol_version in hello (default 1)
+  FAKE_MOSS_CAPS        comma-separated capabilities that are true (default: a reduced build, so
+                        the capability gates the protocol asks clients to keep are exercised)
+  FAKE_MOSS_VERSION     the version in hello (default 2.0.0)
+  FAKE_MOSS_PROTOCOL    the protocol it speaks (default 2); a hello asking for another is refused
+  FAKE_MOSS_HELLO_PROTOCOL the protocol_version its hello answer claims (default: FAKE_MOSS_PROTOCOL)
   FAKE_MOSS_ABI         the abi_version in hello (default 1)
   FAKE_MOSS_STEP_DELAY  seconds per phase or step (default 0.02)
   FAKE_MOSS_RECORD      a file that gets every request line, and "argv ..." at start
@@ -52,15 +54,16 @@ CAPS = {c: False for c in ALL_CAPS}
 for _c in os.environ.get("FAKE_MOSS_CAPS", DEFAULT_CAPS).split(","):
     if _c.strip():
         CAPS[_c.strip()] = True
-VERSION = os.environ.get("FAKE_MOSS_VERSION", "1.0.0")
-PROTOCOL = int(os.environ.get("FAKE_MOSS_PROTOCOL", "1"))
+VERSION = os.environ.get("FAKE_MOSS_VERSION", "2.0.0")
+PROTOCOL = int(os.environ.get("FAKE_MOSS_PROTOCOL", "2"))
+HELLO_PROTOCOL = int(os.environ.get("FAKE_MOSS_HELLO_PROTOCOL", str(PROTOCOL)))
 ABI = int(os.environ.get("FAKE_MOSS_ABI", "1"))
 SLOW_CANCEL = float(os.environ.get("FAKE_MOSS_SLOW_CANCEL", "2"))
 INSPECT_MAX = int(os.environ.get("FAKE_MOSS_INSPECT_MAX", "2"))
 INSPECT_DELAY = float(os.environ.get("FAKE_MOSS_INSPECT_DELAY", "0.02"))
 VALUES = {
     "mode": ["min_memory", "balanced", "max_speed"], "block_path": ["default", "op_by_op", "fused", "fused_graphs"],
-    "tier": ["auto", "reference", "high", "turbo"],
+    "tier": ["reference", "high", "turbo"],
     "attention": ["default", "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc"],
     "dit_direct_io": ["auto", "buffered", "direct"], "te_host_pin": ["auto", "on", "off"],
     "sampler": ["euler", "ab2", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde", "res_multistep", "dataspace"],
@@ -100,7 +103,7 @@ GEN_PARAMS = {
     "accel": {"cfg_truncation", "step_cache", "step_cache_threshold"},
 }
 MODES = {"min_memory", "balanced", "max_speed"}
-TIERS = {"auto", "reference", "high", "turbo"}
+TIERS = {"reference", "high", "turbo"}
 SAMPLERS = {"euler", "ab2", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde", "res_multistep", "dataspace"}
 SCHEDULERS = {"moss", "simple", "normal", "karras", "exponential", "beta", "sgm_uniform"}
 
@@ -270,7 +273,7 @@ def run_generate(j, p):
 
     def finish_cancelled(steps_run):
         finish(j, {"event": "done", "id": j["id"], "status": "cancelled", "steps_run": steps_run,
-              "report": {"cancelled": True, "steps_run": steps_run}, "certified": True, "warnings": []})
+              "report": {"cancelled": True, "steps_run": steps_run}, "warnings": []})
 
     send({"event": "plan", "id": j["id"], "explanation": "fake plan", "plan": {"mode": engine.get("mode", "balanced")}})
     units = total + 3
@@ -313,9 +316,9 @@ def run_generate(j, p):
     write_png(p["output"], p.get("width", 1024), p.get("height", 1024), rgb)
     warnings = ["LoRA layers.0.proj.q: requantized", "prompt truncated to 1 of 2 tokens"] if "WARN" in prompt else []
     report = {"request": p, "seed_used": seed, "steps_run": total, "cancelled": False, "image": p["output"],
-              "quality": {"tier": engine.get("tier", "auto")}, "models": {"dit": {"certified": not p.get("loras")}}}
+              "quality": {"tier": engine.get("tier")}}
     finish(j, {"event": "done", "id": j["id"], "status": "ok", "image": p["output"], "report": report,
-          "certified": not p.get("loras") and "control" not in p, "warnings": warnings})
+          "warnings": warnings})
 
 
 def run_preload(j, p):
@@ -324,12 +327,10 @@ def run_preload(j, p):
         progress(j["id"], phase, 0, 0, 0.0, 0.0)
         time.sleep(DELAY)
         if j["cancel"].is_set():
-            finish(j, {"event": "done", "id": j["id"], "status": "cancelled", "steps_run": 0, "report": {},
-                  "certified": True, "warnings": []})
+            finish(j, {"event": "done", "id": j["id"], "status": "cancelled", "steps_run": 0, "report": {}, "warnings": []})
             return
     finish(j, {"event": "done", "id": j["id"], "status": "ok", "report": {}, "preload_note": "",
-          "dit_load": {"source": "files", "io": "direct", "bytes": 1, "seconds": 0.1, "note": ""},
-          "certified": True, "warnings": []})
+          "dit_load": {"source": "files", "io": "direct", "bytes": 1, "seconds": 0.1, "note": ""}, "warnings": []})
 
 
 def worker(j, fn, p):
@@ -358,7 +359,7 @@ def handle(msg):
         if method == "hello":
             if p.get("protocol_version", PROTOCOL) != PROTOCOL:
                 return err("unsupported_protocol", "unsupported protocol version")
-            hello = {"protocol_version": PROTOCOL, "server": "moss-server", "version": VERSION, "abi_version": ABI,
+            hello = {"protocol_version": HELLO_PROTOCOL, "server": "moss-server", "version": VERSION, "abi_version": ABI,
                        "capabilities": {c: v for c, v in CAPS.items() if v or c in DEFAULT_CAPS.split(",")},
                        "probe": {"message": "fake probe", "device_count": 1, "supported_device_count": 1,
                                  "build_flavour": "cu13"}}
@@ -434,8 +435,10 @@ def handle(msg):
             check_known(p, LOAD_PARAMS)
             if p.get("mode", "balanced") not in MODES:
                 raise ParamError('"mode" must be one of balanced, max_speed, min_memory')
-            if p.get("tier", "auto") not in TIERS:
-                raise ParamError('"tier" must be one of auto, high, reference, turbo')
+            if CAPS["tiers"] and p.get("tier") is None:
+                raise ParamError('"tier" is required: reference, high or turbo')
+            if p.get("tier", "high") not in TIERS:
+                raise ParamError('"tier" must be one of high, reference, turbo')
             with state_lock:
                 if job is not None:
                     return err("busy", "a job is running")
@@ -514,7 +517,7 @@ def handle(msg):
 
 def main():
     if "--version" in sys.argv:
-        print(f"moss-server {VERSION} (protocol {PROTOCOL}, ABI 1)")
+        print(f"moss-server {VERSION} (protocol {PROTOCOL}, ABI {ABI})")
         return
     record("argv " + json.dumps(sys.argv[1:]))
     sys.stderr.write(f"fake moss-server {VERSION} starting\n")

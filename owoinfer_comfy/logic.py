@@ -1,13 +1,11 @@
 """Node logic without ComfyUI: protocol values, model config, request building.
 
-Values and ranges are those of MossInfer's docs/server-protocol.md (protocol 1).
+Values and ranges are those of MossInfer's docs/server-protocol.md (protocol 2).
 """
 
 from __future__ import annotations
 
-import json
 import os
-import struct
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
@@ -17,7 +15,7 @@ FROM_FOLDER = "(from folder)"
 NO_BUNDLE = "(no MOSS-Image folder found)"
 
 MODES = ["balanced", "min_memory", "max_speed"]
-TIERS = ["auto", "reference", "high", "turbo"]
+TIERS = ["reference", "high", "turbo"]
 ATTENTIONS = ["default", "exact", "q8_fp16", "q8_fp16_f32acc", "q8_fp8", "q8_fp8_f32acc"]
 # `dataspace` is left out: it needs a sampler parameters file (a distill bundle's), see README "Planned".
 SAMPLERS = ["euler", "ab2", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde", "res_multistep"]
@@ -136,86 +134,6 @@ def bundle_stamp(model_dir: str) -> list:
     return out
 
 
-# DiT files -------------------------------------------------------------------------------
-
-MAX_HEADER_BYTES = 16 * 1024 * 1024  # real DiT headers are about 100 KB
-
-
-def dit_quant_kind(path: str) -> str:
-    """"int4", "int8", "nvfp4", "fp8", "bf16" or "unknown", from the safetensors header.
-
-    Reads the quantization metadata (`_quantization_metadata`, or ComfyUI's per-layer
-    `comfy_quant` tensors); never the weights.
-    """
-    try:
-        with open(path, "rb") as f:
-            (n,) = struct.unpack("<Q", f.read(8))
-            if n > MAX_HEADER_BYTES:
-                return "unknown"
-            header = json.loads(f.read(n))
-            if not isinstance(header, dict):
-                return "unknown"
-            formats: set[str] = set()
-            meta = header.pop("__metadata__", None)
-            qmeta = meta.get("_quantization_metadata") if isinstance(meta, dict) else None
-            if isinstance(qmeta, str):
-                layers = json.loads(qmeta)
-                layers = layers.get("layers") if isinstance(layers, dict) else None
-                for layer in (layers.values() if isinstance(layers, dict) else ()):
-                    if isinstance(layer, dict):
-                        formats.add(str(layer.get("format", "")).lower())
-            for name, info in header.items():
-                if not (name.endswith(".comfy_quant") and isinstance(info, dict) and info.get("dtype") == "U8"):
-                    continue
-                offsets = info.get("data_offsets")
-                if not (isinstance(offsets, list) and len(offsets) == 2 and all(isinstance(o, int) for o in offsets)):
-                    continue
-                start, end = offsets
-                if 0 <= start <= end and end - start <= 4096:
-                    f.seek(8 + n + start)
-                    q = json.loads(f.read(end - start))
-                    if isinstance(q, dict):
-                        formats.add(str(q.get("format", "")).lower())
-            dtypes = {info.get("dtype") for info in header.values() if isinstance(info, dict)}
-    except (OSError, ValueError, TypeError, RecursionError, struct.error):
-        return "unknown"
-    if any("int4" in f or "w4a4" in f for f in formats):
-        return "int4"
-    if any("nvfp4" in f for f in formats):
-        return "nvfp4"
-    if any("int8" in f for f in formats):
-        return "int8"
-    if "F8_E4M3" in dtypes or any("fp8" in f for f in formats):
-        return "fp8"
-    if dtypes and dtypes <= {"BF16", "F32", "F16"}:
-        return "bf16"
-    return "unknown"
-
-
-TURBO_ONLY = {"int4", "nvfp4"}  # 4-bit DiT files: turbo runs them, auto needs a certificate
-NOT_TURBO = {"int8", "bf16", "fp8"}
-CERT_SIDECAR = ".mossinfer-cert.json"  # <dit>.mossinfer-cert.json: the DiT's own quality certificate
-
-
-def tier_problem(tier: str, dit_kind: str | None, has_certificate: bool = False) -> str:
-    """Why `tier` cannot run this DiT, or "". The tier itself is always sent unchanged.
-
-    `dit_kind` is dit_quant_kind() of the DiT file, None for the folder's own (bf16) DiT.
-    Turbo is chosen explicitly and runs only a 4-bit DiT (INT4, or NVFP4 from MossInfer 1.1
-    on RTX 50 GPUs); `auto` refuses an uncertified 4-bit DiT (integration.md, "Model files").
-    Whether this GPU and engine build run NVFP4 at all is the engine's call. An "unknown"
-    file goes to the engine, which decides. So does a 4-bit file with a sidecar certificate
-    (`has_certificate`): a certificate can let `auto` run it. Certificates in the other places the engine
-    searches (certificate_dirs, the cache folder, the package) are not looked at here.
-    """
-    if dit_kind in TURBO_ONLY and tier == "auto" and not has_certificate:
-        return f"{dit_kind.upper()} DiT file: choose tier turbo (lossy, uncertified)"
-    if tier == "turbo" and (dit_kind is None or dit_kind in NOT_TURBO):
-        what = "the folder's own DiT (bf16)" if dit_kind is None else f"this DiT file ({dit_kind})"
-        return f"tier turbo runs only an INT4 or NVFP4 DiT file, not {what}"
-    return ""
-
-
 # the model config ----------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -227,7 +145,7 @@ class MossModel:
     text_encoder_file: str = ""
     vae_file: str = ""
     mode: str = "balanced"
-    tier: str = "auto"
+    tier: str = "high"
     attention: str = "default"
     loras: tuple[tuple[str, float], ...] = ()
 
@@ -245,11 +163,10 @@ class MossModel:
         if any(files.values()) and not caps.get("model_files"):
             raise missing_capability("Component model files", "model_files", version)
         p.update({k: v for k, v in files.items() if v})
-        if caps.get("tiers"):
-            p["tier"] = self.tier
-            p["attention"] = self.attention
-        elif self.tier != "auto" or self.attention != "default":
-            raise missing_capability("Choosing the tier or attention", "tiers", version)
+        if not caps.get("tiers"):
+            raise missing_capability("Choosing the tier", "tiers", version)
+        p["tier"] = self.tier
+        p["attention"] = self.attention
         if cache_dir:
             p["cache_dir"] = cache_dir
         return p
@@ -428,8 +345,10 @@ def inspected_problems(model: "MossModel", control: "MossControl | None",
     """Why the files of a run can't work, from the server's `inspect` results ([] when they can).
 
     `results` maps each path to its result dict, or to the MossInferError its inspect got.
-    A non-auto tier must be in the DiT's `tiers`. `auto` is never refused from here: inspect
-    looks up no certificates, so a certified GPU and package may run what it calls refused.
+    The tier must be in the DiT's `tiers`, the engine's own decision for that DiT with the bundle's
+    text encoder and the tier's default attention. The other combinations a tier refuses (e.g.
+    `reference` with a quantized text encoder file, or with an 8-bit `attention`), and any tier
+    with the folder's own DiT, are refused by the engine at the first `generate`, with its reason.
     """
     problems: list[str] = []
 
@@ -451,7 +370,7 @@ def inspected_problems(model: "MossModel", control: "MossControl | None",
 
     if model.dit_file:
         dit = check("dit_file", model.dit_file, "dit")
-        if dit is not None and model.tier != "auto" and model.tier not in (dit.get("tiers") or []):
+        if dit is not None and model.tier not in (dit.get("tiers") or []):
             reason = (dit.get("tier_reasons") or {}).get(model.tier) or f"tier {model.tier} does not run this DiT"
             problems.append(f"dit_file {os.path.basename(model.dit_file)}: {reason}")
     if model.text_encoder_file:

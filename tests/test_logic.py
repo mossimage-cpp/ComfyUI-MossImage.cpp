@@ -1,18 +1,14 @@
-"""Node logic without ComfyUI: folders, DiT kinds, tiers, request building, progress."""
+"""Node logic without ComfyUI: folders, request building, progress, inspect results."""
 
-import json
 import os
-import struct
 from dataclasses import replace
 
 import pytest
 
-from helpers import make_bundle, recorded, write_safetensors
+from helpers import make_bundle, recorded
 from owoinfer_comfy import logic
 from owoinfer_comfy.logic import ControlImage, MossControl, MossModel, ProgressMapper
 from owoinfer_comfy.server import MossInferError, ServerManager
-
-COMMUNITY = "/workspace/Models/community"
 
 ALL = {c: True for c in ("preview", "model_files", "lora", "tiers", "samplers", "image_input", "hires",
                          "distill", "control", "accel", "release", "preload", "progress_fraction")}
@@ -53,91 +49,6 @@ def test_find_bundles_depth_limit(tmp_path):
     make_bundle(str(tmp_path / "a" / "b" / "c" / "d"))
     assert logic.find_bundles([str(tmp_path)], max_depth=3) == {}
     assert list(logic.find_bundles([str(tmp_path)], max_depth=4)) == ["a/b/c/d"]
-
-
-# DiT kinds and tiers -----------------------------------------------------------------------
-
-def test_dit_quant_kind_synthetic(tmp_path):
-    int4 = tmp_path / "int4.safetensors"
-    write_safetensors(int4, {"layers.0.proj.q.weight": ("I8", [4])},
-                      metadata={"_quantization_metadata": json.dumps(
-                          {"layers": {"layers.0.proj.q": {"format": "convrot_w4a4"}}})})
-    int8 = tmp_path / "int8.safetensors"
-    q = json.dumps({"format": "int8_tensorwise", "convrot": True}).encode()
-    write_safetensors(int8, {"layers.0.proj.q.weight": ("I8", [4]), "layers.0.proj.q.comfy_quant": ("U8", [0])},
-                      blobs={"layers.0.proj.q.comfy_quant": q})
-    nvfp4 = tmp_path / "nvfp4.safetensors"
-    write_safetensors(nvfp4, {"a.comfy_quant": ("U8", [0]), "b.comfy_quant": ("U8", [0])},
-                      blobs={"a.comfy_quant": q, "b.comfy_quant": json.dumps({"format": "nvfp4"}).encode()})
-    bf16 = tmp_path / "bf16.safetensors"
-    write_safetensors(bf16, {"layers.0.proj.q.weight": ("BF16", [2]), "x": ("F32", [1])})
-    fp8 = tmp_path / "fp8.safetensors"
-    write_safetensors(fp8, {"layers.0.proj.q.weight": ("F8_E4M3", [4])})
-    junk = tmp_path / "junk.safetensors"
-    junk.write_bytes(b"not a safetensors file")
-    assert [logic.dit_quant_kind(str(p)) for p in (int4, int8, nvfp4, bf16, fp8, junk, tmp_path / "missing")] == \
-        ["int4", "int8", "nvfp4", "bf16", "fp8", "unknown", "unknown"]
-
-
-REAL_FILES = {
-    "toxicdog/moss_image_sft_int4_convrot.safetensors": "int4",
-    "comfy-org/moss_image_sft_int8_convrot.safetensors": "int8",
-    "toxicdog/moss_image_sft_turbo_int8_convrot.safetensors": "int8",
-    "bennydaball/moss_image_sft_nvfp4.safetensors": "nvfp4",
-}
-
-
-@pytest.mark.parametrize("name,kind", REAL_FILES.items())
-def test_dit_quant_kind_community_files(name, kind):
-    path = os.path.join(COMMUNITY, name)
-    if not os.path.isfile(path):
-        pytest.skip(f"community file not on this machine: {path}")
-    assert logic.dit_quant_kind(path) == kind
-
-
-def test_dit_quant_kind_malformed_headers(tmp_path):
-    """Crafted headers give "unknown", never an exception."""
-    cases = {
-        "qmeta_dict": {"__metadata__": {"_quantization_metadata": {"layers": {}}}, "w": {"dtype": "I8", "shape": [1], "data_offsets": [0, 1]}},
-        "qmeta_layers_list": {"__metadata__": {"_quantization_metadata": json.dumps({"layers": [1, 2]})}},
-        "qmeta_not_json": {"__metadata__": {"_quantization_metadata": "{oops"}},
-        "metadata_list": {"__metadata__": ["x"]},
-        "offsets_null": {"a.comfy_quant": {"dtype": "U8", "shape": [1], "data_offsets": None}},
-        "offsets_strings": {"a.comfy_quant": {"dtype": "U8", "shape": [1], "data_offsets": ["0", "4"]}},
-        "offsets_backwards": {"a.comfy_quant": {"dtype": "U8", "shape": [1], "data_offsets": [8, 2]}},
-        "tensor_not_object": {"w": 5},
-        "deep_qmeta": {"__metadata__": {"_quantization_metadata": "[" * 100000 + "]" * 100000}},
-    }
-    for name, header in cases.items():
-        raw = json.dumps(header).encode()
-        path = tmp_path / f"{name}.safetensors"
-        path.write_bytes(struct.pack("<Q", len(raw)) + raw + b"\0" * 16)
-        assert logic.dit_quant_kind(str(path)) in ("unknown", "bf16", "fp8"), name
-    top_list = tmp_path / "list.safetensors"
-    top_list.write_bytes(struct.pack("<Q", 2) + b"[]")
-    huge = tmp_path / "huge.safetensors"
-    huge.write_bytes(struct.pack("<Q", logic.MAX_HEADER_BYTES + 1) + b"{}")
-    assert logic.dit_quant_kind(str(top_list)) == "unknown" and logic.dit_quant_kind(str(huge)) == "unknown"
-
-
-def test_tier_problem():
-    assert logic.tier_problem("auto", None) == ""
-    assert logic.tier_problem("high", "int8") == ""
-    assert logic.tier_problem("reference", "int8") == ""  # the engine refuses it, with its message
-    assert logic.tier_problem("turbo", "int4") == ""
-    # auto is sent unchanged, never rewritten: the user picks turbo
-    assert logic.tier_problem("auto", "int4") == "INT4 DiT file: choose tier turbo (lossy, uncertified)"
-    assert logic.tier_problem("high", "int4") == ""  # the engine decides
-    assert "not the folder's own DiT" in logic.tier_problem("turbo", None)
-    for kind in ("int8", "bf16", "fp8"):
-        assert f"not this DiT file ({kind})" in logic.tier_problem("turbo", kind)
-    # NVFP4 (MossInfer 1.1, RTX 50) follows INT4's policy; the engine decides whether it runs here
-    assert logic.tier_problem("turbo", "nvfp4") == ""
-    assert logic.tier_problem("auto", "nvfp4") == "NVFP4 DiT file: choose tier turbo (lossy, uncertified)"
-    assert logic.tier_problem("auto", "nvfp4", has_certificate=True) == ""
-    assert logic.tier_problem("turbo", "unknown") == ""  # a file the pack cannot read goes to the engine
-    # an INT4 file with its own sidecar certificate: the engine decides what auto runs
-    assert logic.tier_problem("auto", "int4", has_certificate=True) == ""
 
 
 def test_file_and_model_stamps(tmp_path):
@@ -183,7 +94,7 @@ def test_find_bundles_is_cached_until_a_folder_changes(tmp_path, monkeypatch):
 
 def test_model_load_params_and_loras():
     m = MossModel("/m/sft", dit_file="/d.safetensors", tier="high")
-    assert m.load_params(ALL, "1.1.0", "/cache") == {
+    assert m.load_params(ALL, "2.0.0", "/cache") == {
         "model": "/m/sft", "mode": "balanced", "dit_file": "/d.safetensors", "tier": "high",
         "attention": "default", "cache_dir": "/cache"}
     chained = m.with_lora("/a.safetensors", 0.5).with_lora("/b.safetensors", 1)
@@ -195,9 +106,10 @@ def test_model_load_params_and_loras():
 def test_model_load_params_gating():
     with pytest.raises(MossInferError, match="'model_files' capability; this one \\(0.1\\)"):
         MossModel("/m", vae_file="/v").load_params({"tiers": True}, "0.1")
-    with pytest.raises(MossInferError, match="'tiers'"):
-        MossModel("/m", tier="high").load_params({}, "0.1")
-    assert MossModel("/m").load_params({}, "0.1") == {"model": "/m", "mode": "balanced"}
+    with pytest.raises(MossInferError, match="'tiers'"):  # the tier is required; a server without it can't take one
+        MossModel("/m").load_params({}, "0.1")
+    assert MossModel("/m").load_params({"tiers": True}, "2.0.0") == {
+        "model": "/m", "mode": "balanced", "tier": "high", "attention": "default"}
 
 
 def test_control_chain():
@@ -216,7 +128,7 @@ def test_control_chain():
 def test_generate_params_full_build():
     p = logic.build_generate_params(values(sampler="heun", scheduler="karras", step_cache="fbcache",
                                            step_cache_threshold=0.03, hires_width=512, hires_height=512),
-                                    ALL, "1.1.0", output="/o.png", preview_output="/p.png",
+                                    ALL, "2.0.0", output="/o.png", preview_output="/p.png",
                                     init_image="/i.png", mask="/m.png", loras=[("/l.safetensors", 0.7)],
                                     control={"adapter": "/a"})
     assert p["output"] == "/o.png" and p["save_metadata"] is False
@@ -334,12 +246,14 @@ def test_inspected_problems():
     good = {"/d/int8.safetensors": INT8_DIT, "/t/te.safetensors": {"kind": "text_encoder", "loadable": True},
             "/v/vae.safetensors": {"kind": "vae", "loadable": True}, "/l/a.safetensors": LORA,
             "/c/control.safetensors": CONTROL}
-    # a non-auto tier not in `tiers`: the server's reason
+    # a tier not in `tiers`: the server's reason
     assert logic.inspected_problems(m, None, good) == [
         "dit_file int8.safetensors: " + INT8_DIT["tier_reasons"]["reference"]]
     assert logic.inspected_problems(replace(m, tier="high"), None, good) == []
-    # auto is never refused from inspect (no certificates looked up), even for INT4
-    assert logic.inspected_problems(replace(m, tier="auto"), None, dict(good, **{"/d/int8.safetensors": INT4_DIT})) == []
+    int4 = dict(good, **{"/d/int8.safetensors": INT4_DIT})
+    assert logic.inspected_problems(replace(m, tier="high"), None, int4) == [
+        "dit_file int8.safetensors: " + INT4_DIT["tier_reasons"]["high"]]
+    assert logic.inspected_problems(replace(m, tier="turbo"), None, int4) == []
     # wrong kinds in a slot
     wrong = dict(good, **{"/d/int8.safetensors": LORA, "/v/vae.safetensors": {"kind": "text_encoder", "loadable": True}})
     assert logic.inspected_problems(replace(m, tier="high"), None, wrong) == [
@@ -366,7 +280,7 @@ def test_inspected_problems():
 
 def test_value_problems():
     values = {"sampler": ["euler", "ab2"], "attention": ["default", "exact"], "mode": ["balanced"]}
-    load = {"model": "/m", "mode": "balanced", "tier": "auto", "attention": "q8_fp8"}
+    load = {"model": "/m", "mode": "balanced", "tier": "high", "attention": "q8_fp8"}
     gen = {"sampler": "heun", "scheduler": "karras", "prompt": "p"}
     assert logic.value_problems(values, load, gen, "1.0.9") == [
         "attention 'q8_fp8' is not supported by this moss-server (1.0.9); it accepts: default, exact",

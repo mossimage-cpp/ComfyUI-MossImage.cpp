@@ -1,7 +1,7 @@
 """moss-server sidecar client: locating, spawning, framing, one job at a time.
 
 Standard library only, with no ComfyUI imports, so it can be tested on its own.
-The protocol is MossInfer's docs/server-protocol.md (protocol 1).
+The protocol is MossInfer's docs/server-protocol.md (protocol 2).
 """
 
 from __future__ import annotations
@@ -22,8 +22,9 @@ from typing import Any, Callable, Iterable, Iterator
 
 log = logging.getLogger("owoinfer")
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 ABI_VERSION = 1
+NEEDS = f"the pack needs a MossInfer 2.x moss-server (protocol {PROTOCOL_VERSION}, engine ABI {ABI_VERSION})"
 CLIENT_NAME = "ComfyUI-MossImage-owoinfer"
 SERVER_ENV = "MOSSINFER_SERVER"
 SERVER_EXE = "moss-server.exe" if os.name == "nt" else "moss-server"
@@ -63,7 +64,7 @@ class ServerCrashed(MossInferError):
         super().__init__("crashed", message)
 
 
-def _adapter_stamp(path: str) -> tuple[int, int] | None:
+def _file_stamp(path: str) -> tuple[int, int] | None:
     try:
         st = os.stat(path)
     except OSError:
@@ -428,12 +429,12 @@ class Session:
                                  f"inspect needs a moss-server with the 'inspect' capability (this one is {self.version})")
         m = self._m
         proc = m._require_proc()
-        build = (proc.server_path, _adapter_stamp(proc.server_path), self.version,
+        build = (proc.server_path, _file_stamp(proc.server_path), self.version,
                  str((self.hello.get("probe") or {}).get("build_flavour", "")))
         out: dict[str, dict[str, Any] | MossInferError] = {}
         todo: list[tuple[str, tuple, float]] = []  # (path, cache key, give up at)
         for path in dict.fromkeys(paths):
-            key = (path, _adapter_stamp(path), build)
+            key = (path, _file_stamp(path), build)
             if key in m._inspect_cache:
                 out[path] = m._inspect_cache[key]
             else:
@@ -498,39 +499,25 @@ class Session:
             self._m._after_error(e)
             raise
 
-    def ensure_loaded(self, load_params: dict[str, Any], stamp: Any = None, adapters: Iterable[str] = ()) -> bool:
+    def ensure_loaded(self, load_params: dict[str, Any], stamp: Any = None) -> bool:
         """`load` unless the engine already runs exactly this config. True if it loaded.
 
         `stamp` (e.g. the model files' sizes and mtimes) is part of the config, so a
-        replaced file loads again.
-
-        `adapters` are the LoRA and control adapter files the next job uses. Engines up to
-        1.0 (and no capability says which) key them by path, so one replaced under the same
-        name would keep its old weights: when a path's (mtime, size) differs from the last
-        time it ran on this engine, the engine is unloaded and loaded again first.
+        replaced file loads again. LoRA and control adapter files are not part of it: the
+        engine reads one replaced under the same name anew by itself.
         """
         m = self._m
         key = json.dumps([load_params, stamp], sort_keys=True, default=str)
-        stamps = {path: _adapter_stamp(path) for path in adapters}
-        stale = [path for path, st in stamps.items() if path in m._adapter_stamps and m._adapter_stamps[path] != st]
-        if key == m._loaded_key and not stale:
-            m._adapter_stamps.update(stamps)
+        if key == m._loaded_key:
             return False
-        if key == m._loaded_key and stale:
-            log.info("moss-server: %s changed on disk; loading the engine again so it reads the new file",
-                     ", ".join(os.path.basename(p) for p in stale))
-            self.unload()
         m._loaded_key = None  # a failed load leaves no engine
-        m._adapter_stamps = {}
         self.request("load", load_params)
         m._loaded_key = key
-        m._adapter_stamps.update(stamps)
         return True
 
     def unload(self) -> None:
         self.request("unload")
         self._m._loaded_key = None
-        self._m._adapter_stamps = {}
 
     def release(self, keep_host_copy: bool = True, *, should_cancel: Callable[[], bool] | None = None,
                 timeout: float = RELEASE_TIMEOUT) -> dict[str, Any]:
@@ -668,7 +655,6 @@ class ServerManager:
         self._proc: ServerProcess | None = None
         self._hello: dict[str, Any] | None = None
         self._loaded_key: str | None = None
-        self._adapter_stamps: dict[str, tuple[int, int] | None] = {}  # LoRA / control files used on this engine
         self._inspect_cache: dict[tuple, dict[str, Any]] = {}  # (path, stamp, (version, flavour)) -> inspect result
         self._log_rotated = False
         atexit.register(self.shutdown)
@@ -709,8 +695,11 @@ class ServerManager:
         self._proc = proc
         try:
             hello = proc.request("hello", {"client": CLIENT_NAME, "protocol_version": PROTOCOL_VERSION})
-        except MossInferError:
+        except MossInferError as e:
             self._discard_process(kill=True)
+            if e.code == "unsupported_protocol":  # e.g. a 1.x server, which speaks protocol 1 only
+                raise MossInferError(e.code, f"{server_path} does not speak protocol {PROTOCOL_VERSION} ({e}); "
+                                             f"{NEEDS}") from None
             raise
         code = problem = ""
         if hello.get("protocol_version") != PROTOCOL_VERSION:
@@ -719,7 +708,7 @@ class ServerManager:
             code, problem = "abi_mismatch", f"has engine ABI {hello.get('abi_version')}, not {ABI_VERSION}"
         if problem:
             self._discard_process()
-            raise MossInferError(code, f"{server_path} {problem}; use a MossInfer 1.x release")
+            raise MossInferError(code, f"{server_path} (MossInfer {hello.get('version')}) {problem}; {NEEDS}")
         self._hello = hello
         probe = hello.get("probe") or {}
         log.info("moss-server %s started (%s); %s", hello.get("version"), server_path, probe.get("message", ""))
@@ -740,7 +729,6 @@ class ServerManager:
         proc, self._proc = self._proc, None
         self._hello = None
         self._loaded_key = None
-        self._adapter_stamps = {}
         if proc is None:
             return
         if kill:

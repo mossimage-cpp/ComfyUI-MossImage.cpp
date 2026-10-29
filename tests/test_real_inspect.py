@@ -1,7 +1,7 @@
 """`inspect` and hello `values` from a real moss-server, on the community files. No GPU.
 
-Runs when MOSS_SERVER names a moss-server with the `inspect` capability (MossInfer 1.1);
-skipped, saying so, otherwise. inspect reads file headers only and needs no engine.
+Runs when MOSS_SERVER names a MossInfer 2.0 or later moss-server; skipped, saying so,
+otherwise. inspect reads file headers only and needs no engine.
 """
 
 import os
@@ -14,6 +14,7 @@ from owoinfer_comfy.logic import ControlImage, MossControl, MossModel
 from owoinfer_comfy.server import MossInferError, ServerManager
 
 DIT_INT4 = os.path.join(MODELS, "community", "toxicdog", "moss_image_sft_int4_convrot.safetensors")
+DIT_NVFP4 = os.path.join(MODELS, "community", "bennydaball", "moss_image_sft_nvfp4.safetensors")
 CONTROL = os.path.join(COMFY_ORG, "moss_image_color_depth_control.safetensors")
 VAE = os.path.join(COMFY_ORG, "flux2-vae.safetensors")
 FILES = [DIT_INT8, DIT_INT4, LORA_4STEP, CONTROL, TE_INT8, VAE]
@@ -28,10 +29,13 @@ def session(tmp_path_factory):
         pytest.skip(f"model files not on this machine: {missing}")
     m = ServerManager(log_dir=str(tmp_path_factory.mktemp("real-inspect")))
     try:
-        with m.session(GPU_SERVER) as s:
-            if not s.has("inspect"):
-                pytest.skip(f"{GPU_SERVER} ({s.version}) has no 'inspect' capability; set MOSS_SERVER to a 1.1 build")
-            yield s
+        try:
+            with m.session(GPU_SERVER) as s:
+                yield s
+        except MossInferError as e:
+            if e.code != "unsupported_protocol":
+                raise
+            pytest.skip(f"{e}; set MOSS_SERVER to a 2.0 build")
     finally:
         m.shutdown()
 
@@ -39,8 +43,10 @@ def session(tmp_path_factory):
 def test_files(session):
     r = session.inspect(FILES)
     assert r[DIT_INT8]["kind"] == "dit" and r[DIT_INT8]["loadable"] and r[DIT_INT8]["precision"] == "int8"
-    assert "high" in r[DIT_INT8]["tiers"] and "reference" not in r[DIT_INT8]["tiers"]
+    assert r[DIT_INT8]["tiers"] == ["high"] and set(r[DIT_INT8]["tier_reasons"]) == set(logic.TIERS)
     assert r[DIT_INT4]["kind"] == "dit" and r[DIT_INT4]["tiers"] == ["turbo"]
+    for reason in (r[DIT_INT8]["tier_reasons"]["high"], r[DIT_INT4]["tier_reasons"]["turbo"]):
+        assert "8-bit attention" in reason and "certif" not in reason
     assert r[LORA_4STEP]["kind"] == "lora" and r[LORA_4STEP]["loadable"] and r[LORA_4STEP]["lora_rank"] > 0
     assert r[CONTROL]["kind"] == "control_adapter" and set(r[CONTROL]["control_kinds"]) == {"color", "depth"}
     assert r[TE_INT8]["kind"] == "text_encoder" and r[TE_INT8]["precision"] == "int8"
@@ -60,8 +66,8 @@ def test_the_pack_checks_on_real_results(session):
     problems = logic.inspected_problems(int8, None, r)
     assert len(problems) == 1 and problems[0].startswith("dit_file moss_image_sft_int8_convrot.safetensors: ")
     assert "reference" in problems[0]
-    # auto with INT4: never refused from inspect (no certificates looked up)
-    assert logic.inspected_problems(MossModel("/m", dit_file=DIT_INT4, tier="auto"), None, r) == []
+    high = logic.inspected_problems(MossModel("/m", dit_file=DIT_INT4, tier="high"), None, r)
+    assert high == ["dit_file moss_image_sft_int4_convrot.safetensors: " + r[DIT_INT4]["tier_reasons"]["high"]]
     assert logic.inspected_problems(MossModel("/m", dit_file=DIT_INT4, tier="turbo"), None, r) == []
     # wrong kinds
     swapped = MossModel("/m", dit_file=LORA_4STEP, vae_file=TE_INT8).with_lora(CONTROL, 1.0)
@@ -83,3 +89,14 @@ def test_the_node_lists_are_the_servers(session):
                           ("noise_layout", logic.NOISE_LAYOUTS), ("noise_source", logic.NOISE_SOURCES),
                           ("resize", logic.RESIZE_MODES), ("step_cache", logic.STEP_CACHES)):
         assert set(offered) <= set(values[name]), (name, offered, values[name])
+    assert values["tier"] == logic.TIERS  # 2.0: exactly these, no `auto`
+
+
+def test_nvfp4(session):
+    if not os.path.isfile(DIT_NVFP4):
+        pytest.skip(f"model file not on this machine: {DIT_NVFP4}")
+    r = session.inspect([DIT_NVFP4])[DIT_NVFP4]
+    if not r["loadable"] and "this build of MossInfer does not include" in r.get("note", ""):
+        pytest.skip(f"this moss-server has no NVFP4 kernels: {r['note']}")
+    assert r["kind"] == "dit" and r["precision"] == "nvfp4" and r["tiers"] == ["turbo"]
+    assert "RTX 50 only" in r["tier_reasons"]["turbo"]

@@ -103,7 +103,7 @@ def test_example_workflow_makes_an_image(comfy):
     assert sent["preview_every"] == 1 and "init_image" not in sent
     load = [p for m, p in recorded(comfy.env) if m == "load"]
     assert len(load) == 1 and load[0]["model"].endswith(os.path.join("moss_image", "MOSS-Image-SFT"))
-    assert load[0]["tier"] == "auto" and load[0]["cache_dir"].endswith(os.path.join("ComfyUI-MossImage-owoinfer", "cache"))
+    assert load[0]["tier"] == "high" and load[0]["cache_dir"].endswith(os.path.join("ComfyUI-MossImage-owoinfer", "cache"))
     # the job's temp files are gone
     assert os.listdir(os.path.join(comfy.base, "temp", "ComfyUI-MossImage-owoinfer")) == []
     assert "MOSS-Image: seed 42" in comfy.log()
@@ -143,7 +143,7 @@ def test_after_run_unload(comfy):
 def test_after_run_release_needs_the_capability(comfy):
     entry = comfy.wait_history(comfy.queue(small(load_workflow_prompt(comfy), seed=23, after_run="release")))
     errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
-    assert "after_run release needs a moss-server with the 'release' capability; this one (1.0.0)" in errors[0]["exception_message"]
+    assert "after_run release needs a moss-server with the 'release' capability; this one (2.0.0)" in errors[0]["exception_message"]
 
 
 def loader(prompt, **kw):
@@ -151,29 +151,27 @@ def loader(prompt, **kw):
     return prompt
 
 
-def test_int4_dit_with_auto_is_refused_before_running(comfy):
-    prompt = loader(small(load_workflow_prompt(comfy), seed=24), dit_file="test_int4.safetensors", tier="auto")
+def test_saved_tier_auto_is_refused_when_queued(comfy):
+    """A workflow saved with 1.x's tier `auto`: ComfyUI's own combo check refuses it."""
+    prompt = loader(small(load_workflow_prompt(comfy), seed=24), tier="auto")
     with pytest.raises(RuntimeError) as e:
         comfy.queue(prompt)
-    assert "INT4 DiT file: choose tier turbo (lossy, uncertified)" in str(e.value)
-    prompt = loader(small(load_workflow_prompt(comfy), seed=24), tier="turbo")  # the folder's bf16 DiT
-    with pytest.raises(RuntimeError, match="tier turbo runs only an INT4 or NVFP4 DiT file"):
-        comfy.queue(prompt)
+    assert "tier: 'auto' not in ['reference', 'high', 'turbo']" in str(e.value)
     prompt = loader(small(load_workflow_prompt(comfy), seed=24), dit_file="nope.safetensors")
-    with pytest.raises(RuntimeError, match="dit_file not found"):  # the combo check validate_inputs repeats
+    with pytest.raises(RuntimeError, match="dit_file: 'nope.safetensors' not in"):
         comfy.queue(prompt)
 
 
-def test_linked_tier_is_checked_at_run_time(comfy):
-    """A linked input is None in validate_inputs: the loader checks it when it runs."""
+def test_linked_tier_is_checked_by_the_server(comfy):
+    """ComfyUI does not check a linked combo input: the server refuses the name at `load`."""
     prompt = loader(small(load_workflow_prompt(comfy), seed=29), dit_file="test_int4.safetensors")
     # ComfyUI's If/Else Switch passes any type through, so it can feed a combo input
     prompt["30"] = {"class_type": "ComfySwitchNode", "inputs": {"switch": True, "on_true": "auto", "on_false": "auto"}}
     find(prompt, "OwoInferMossImageModelLoader")["tier"] = ["30", 0]
     entry = comfy.wait_history(comfy.queue(prompt))  # accepted: nothing to check before it runs
     errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
-    assert errors and errors[0]["node_type"] == "OwoInferMossImageModelLoader"
-    assert "INT4 DiT file: choose tier turbo (lossy, uncertified)" in errors[0]["exception_message"]
+    assert errors and errors[0]["node_type"] == "OwoInferMossImageGenerate"
+    assert '"tier" must be one of high, reference, turbo' in errors[0]["exception_message"]
     prompt["30"]["inputs"]["on_true"] = "turbo"
     entry = comfy.wait_history(comfy.queue(prompt))
     assert entry["status"]["status_str"] == "success", entry["status"]
@@ -238,20 +236,20 @@ def test_exit_shuts_the_server_down(comfy):
     comfy.stop()
     lines = [m for m, _ in recorded(comfy.env)]
     assert lines[-1] == "shutdown"
-    assert "inspect" not in lines  # a server without the capability: the header checks only
+    assert "inspect" not in lines  # a server without the capability: the engine checks the files at the run
     # one long-lived server for every run, started by the first one
     assert [p for m, p in recorded(comfy.env) if m == "argv"].count(["--parent-pid", str(comfy.proc.pid)]) == 1
 
 
 @pytest.fixture(scope="module")
 def comfy_release(tmp_path_factory):
-    """A second ComfyUI whose fake moss-server has `release` (MossInfer 1.1)."""
+    """A second ComfyUI whose fake moss-server has `release`."""
     tmp = tmp_path_factory.mktemp("e2e-fake-release")
     base = make_base(str(tmp / "base"))
     make_bundle(os.path.join(base, "models", "moss_image", "MOSS-Image-SFT"))
     env = dict(os.environ, MOSSINFER_SERVER=make_fake_server(str(tmp / "bin")),
                FAKE_MOSS_RECORD=str(tmp / "requests.jsonl"), FAKE_MOSS_STEP_DELAY="0.02",
-               FAKE_MOSS_CAPS="preview,model_files,lora,tiers,samplers,image_input,release", FAKE_MOSS_VERSION="1.1.0",
+               FAKE_MOSS_CAPS="preview,model_files,lora,tiers,samplers,image_input,release",
                FAKE_MOSS_RELEASE_DELAY="0.5")
     c = ComfyUI(base, env)
     c.env = env

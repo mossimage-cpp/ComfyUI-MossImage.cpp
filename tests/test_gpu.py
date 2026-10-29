@@ -101,19 +101,10 @@ def test_lora(comfy):
     assert_ok(entry, comfy)
     _, pixels = output_image(comfy, entry)
     assert pixels.std() > 0.05
-    assert "MOSS-Image: seed 4, tier" in comfy.log() and "uncertified" in comfy.log().split("MOSS-Image: seed 4")[1]
+    assert "MOSS-Image: seed 4, tier high" in comfy.log()
 
 
 def test_after_run_release(comfy):
-    from owoinfer_comfy.server import ServerManager
-    probe = ServerManager(log_dir=os.path.join(comfy.base, "probe"))
-    try:
-        with probe.session(GPU_SERVER) as s:  # hello only: no engine, no VRAM
-            has_release = s.has("release")
-    finally:
-        probe.shutdown()
-    if not has_release:
-        pytest.skip(f"{GPU_SERVER} has no 'release' capability; set MOSS_SERVER to a 1.1 build")
     entry = comfy.wait_history(comfy.queue(workflow(comfy, steps=2, seed=12, after_run="release")), timeout=600)
     assert_ok(entry, comfy)
     assert "MOSS-Image: released" in comfy.log()

@@ -84,7 +84,7 @@ class ModelLoader(io.ComfyNode):
                                tooltip=f"A MOSS-Image bundle folder (Base or SFT, from Hugging Face) under models/{MODEL_FOLDER}/. "
                                        "It supplies the tokenizer and configs, and the components not replaced below."),
                 io.Combo.Input("dit_file", options=cls._dit_options(), default=FROM_FOLDER,
-                               tooltip="A single-file DiT (ComfyUI / community INT8 ConvRot, INT4 ConvRot, bf16) "
+                               tooltip="A single-file DiT (ComfyUI / community INT8 ConvRot, INT4 ConvRot, NVFP4, bf16) "
                                        "from diffusion_models."),
                 io.Combo.Input("text_encoder_file", options=[FROM_FOLDER] + folder_paths.get_filename_list("text_encoders"),
                                default=FROM_FOLDER,
@@ -94,11 +94,14 @@ class ModelLoader(io.ComfyNode):
                 io.Combo.Input("mode", options=logic.MODES, default="balanced",
                                tooltip="Memory mode. balanced adapts to free VRAM; min_memory shares the GPU with "
                                        "other apps; max_speed uses the RAM it can."),
-                io.Combo.Input("tier", options=logic.TIERS, default="auto",
-                               tooltip="Quality tier. auto picks the fastest certified configuration. "
-                                       "turbo (lossy, uncertified) is for INT4 and NVFP4 DiT files only, and they need it."),
+                io.Combo.Input("tier", options=logic.TIERS, default="high",
+                               tooltip="Quality tier. reference: bf16 DiT and text encoder, exact attention. high: the "
+                                       "DiT's INT8 or bf16 GEMMs, 8-bit attention (with an INT8 DiT, the everyday "
+                                       "choice). turbo: an INT4 or NVFP4 DiT file (NVFP4 on RTX 50 only), 8-bit "
+                                       "attention."),
                 io.Combo.Input("attention", options=logic.ATTENTIONS, default="default", advanced=True,
-                               tooltip="Overrides the tier's attention: exact or an 8-bit mode."),
+                               tooltip="Overrides the tier's attention. reference takes exact only; high with a bf16 "
+                                       "DiT takes 8-bit modes only (exact with bf16 is reference)."),
             ],
             outputs=[MossModelType.Output(display_name="moss_model")],
         )
@@ -106,24 +109,6 @@ class ModelLoader(io.ComfyNode):
     @staticmethod
     def _dit_options() -> list[str]:
         return [FROM_FOLDER] + folder_paths.get_filename_list("diffusion_models")
-
-    @classmethod
-    def validate_inputs(cls, dit_file=None, tier=None) -> bool | str:
-        # ComfyUI skips its own checks for the inputs named here, so they are repeated.
-        # A linked input is None here (its value comes at run time): execute() checks it then.
-        if dit_file is None or tier is None:
-            return True
-        return cls._check(dit_file, tier) or True
-
-    @classmethod
-    def _check(cls, dit_file: str, tier: str) -> str:
-        if dit_file not in cls._dit_options():
-            return f"dit_file not found in diffusion_models: {dit_file}"
-        if tier not in logic.TIERS:
-            return f"tier must be one of {', '.join(logic.TIERS)}"
-        dit = _file_choice("diffusion_models", dit_file)
-        return logic.tier_problem(tier, logic.dit_quant_kind(dit) if dit else None,
-                                  has_certificate=bool(dit) and os.path.isfile(dit + logic.CERT_SIDECAR))
 
     @classmethod
     def fingerprint_inputs(cls, model_folder, dit_file, text_encoder_file, vae_file, **kwargs):
@@ -135,9 +120,6 @@ class ModelLoader(io.ComfyNode):
     @classmethod
     def execute(cls, model_folder, dit_file, text_encoder_file, vae_file, mode, tier,
                 attention="default") -> io.NodeOutput:
-        problem = cls._check(dit_file, tier)  # again: linked inputs skipped validate_inputs
-        if problem:
-            raise ValueError(problem)
         bundles = _bundles()
         if model_folder not in bundles:
             raise ValueError(f"MOSS-Image folder {model_folder!r} not found in "
@@ -184,7 +166,7 @@ class Control(io.ComfyNode):
             display_name="MOSS-Image Control",
             category=CATEGORY,
             description="A control adapter (e.g. MOSS-Image color / depth control) with one conditioning image. "
-                        "Chain one node per kind. Lossy: runs with it are uncertified.",
+                        "Chain one node per kind.",
             inputs=[
                 io.Combo.Input("adapter", options=folder_paths.get_filename_list("loras"),
                                tooltip="The control adapter file, from loras."),
@@ -242,7 +224,7 @@ class Generate(io.ComfyNode):
                 io.Int.Input("seed", default=42, min=0, max=logic.MAX_SEED, control_after_generate=True),
                 io.Combo.Input("sampler", options=logic.SAMPLERS, default="euler"),
                 io.Combo.Input("scheduler", options=logic.SCHEDULERS, default="moss",
-                               tooltip="moss with euler is the official pipeline."),
+                               tooltip="moss with euler and tier reference is the official pipeline."),
                 io.Float.Input("shift", default=5.0, min=0.01, max=100.0, step=0.01),
                 io.Image.Input("init_image", optional=True, tooltip="img2img: the starting image (the first of a batch)."),
                 io.Mask.Input("mask", optional=True,
@@ -282,7 +264,7 @@ class Generate(io.ComfyNode):
                                          "method is none."),
                 io.Combo.Input("after_run", options=logic.AFTER_RUN, default="keep", advanced=True,
                                tooltip="keep: the model stays in VRAM, which ComfyUI's memory manager cannot see. "
-                                       "release (moss-server with the release capability): VRAM freed, weights kept "
+                                       "release: VRAM freed, weights kept "
                                        "in RAM for a fast reload. unload: everything freed."),
                 io.Boolean.Input("free_comfy_vram", default=True, advanced=True,
                                  tooltip="Unload ComfyUI's own models first, so they and the engine do not both hold VRAM."),
@@ -347,8 +329,7 @@ class Generate(io.ComfyNode):
                     problems += logic.inspected_problems(moss_model, control, inspected)
                 if problems:
                     raise MossInferError("invalid_params", "\n".join(problems))
-                adapters = [path for path, _ in moss_model.loras] + ([control.adapter] if control is not None else [])
-                s.ensure_loaded(load_params, moss_model.stamp(), adapters)
+                s.ensure_loaded(load_params, moss_model.stamp())
                 try:
                     done = s.run_job("generate", params, on_event=cls._event_handler(caps, values["steps"], node_id),
                                      should_cancel=mm.processing_interrupted)
@@ -425,8 +406,7 @@ class Generate(io.ComfyNode):
             raise MossInferError(str(err.get("code", "internal")), str(err.get("message", "generation failed")))
         report = done.get("report") or {}
         quality = report.get("quality") or {}
-        summary = (f"seed {report.get('seed_used')}, tier {quality.get('tier', '?')}, "
-                   f"{'certified' if done.get('certified') else 'uncertified'}")
+        summary = f"seed {report.get('seed_used')}, tier {quality.get('tier', '?')}"
         log.info("MOSS-Image: %s", summary)
         _progress_text(node_id, "\n".join([summary] + [f"warning: {w}" for w in warnings]))
         return load_image_tensor(done.get("image") or output)

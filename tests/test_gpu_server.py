@@ -8,6 +8,7 @@ import shutil
 import signal
 
 import pytest
+from PIL import Image
 
 from helpers import DIT_INT8, GPU_SERVER, SFT, TE_INT8, gpu_skip_reason
 from owoinfer_comfy import logic
@@ -42,14 +43,8 @@ def model():
     return MossModel(SFT, dit_file=DIT_INT8, text_encoder_file=TE_INT8)
 
 
-def test_configs_only_folder_is_refused(manager):
-    """The README's claim: the bundle folder must hold its own weights, even with every component file set.
-
-    The engine indexes text_encoder/, transformer/ and vae/ from the folder whatever the
-    component files (src/weights/model_index.cpp, build_index), so a folder of configs and
-    tokenizer only fails the first generate with `model`. If this starts passing, the
-    engine has changed: update the README's "Model files".
-    """
+def test_configs_only_folder_runs(manager):
+    """A folder of configs and tokenizer only, with every component from a file, makes the same image as the full folder."""
     folder = manager.tmp / "configs-only" / "MOSS-Image-SFT"
     shutil.copytree(os.path.join(SFT, "tokenizer"), folder / "tokenizer")
     for c in ("transformer", "text_encoder", "vae"):
@@ -57,14 +52,19 @@ def test_configs_only_folder_is_refused(manager):
         shutil.copy(os.path.join(SFT, c, "config.json"), folder / c / "config.json")
     shutil.copy(os.path.join(SFT, "model_index.json"), folder / "model_index.json")
     vae = os.path.join(os.path.dirname(DIT_INT8), "flux2-vae.safetensors")
-    m = MossModel(str(folder), dit_file=DIT_INT8, text_encoder_file=TE_INT8, vae_file=vae)
-    with manager.session(GPU_SERVER) as s:
-        s.ensure_loaded(m.load_params(s.capabilities, s.version, manager.cache_dir))  # load only checks the path
-        p = logic.build_generate_params(params(manager.tmp), s.capabilities, s.version, output=str(manager.tmp / "c.png"))
-        done = s.run_job("generate", p)
-        s.unload()
-    assert done["status"] == "error" and done["error"]["code"] == "model"
-    assert "text_encoder" in done["error"]["message"] and "safetensors" in done["error"]["message"]
+    images = []
+    for i, root in enumerate((str(folder), SFT)):
+        m = MossModel(root, dit_file=DIT_INT8, text_encoder_file=TE_INT8, vae_file=vae)
+        with manager.session(GPU_SERVER) as s:
+            s.ensure_loaded(m.load_params(s.capabilities, s.version, manager.cache_dir))
+            out = manager.tmp / f"c{i}.png"
+            p = logic.build_generate_params(params(manager.tmp, steps=2), s.capabilities, s.version, output=str(out))
+            done = s.run_job("generate", p)
+            s.unload()
+        assert done["status"] == "ok", done
+        with Image.open(out) as img:
+            images.append(img.tobytes())
+    assert images[0] == images[1]
 
 
 def test_previews_and_progress(manager):
@@ -120,8 +120,6 @@ def test_killed_server_is_restarted(manager):
 
 def test_release_then_generate(manager):
     with manager.session(GPU_SERVER) as s:
-        if not s.has("release"):
-            pytest.skip(f"this moss-server ({s.version}) has no 'release' capability; set MOSS_SERVER to a 1.1 build")
         s.ensure_loaded(model().load_params(s.capabilities, s.version, manager.cache_dir))
         p = logic.build_generate_params(params(manager.tmp, steps=2), s.capabilities, s.version,
                                         output=str(manager.tmp / "r.png"))

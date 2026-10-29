@@ -28,7 +28,7 @@ def gen_params(tmp_path, **kw):
 def load(session, tmp_path):
     model = tmp_path / "bundle"
     model.mkdir(exist_ok=True)
-    return session.ensure_loaded({"model": str(model), "mode": "balanced"})
+    return session.ensure_loaded({"model": str(model), "mode": "balanced", "tier": "high"})
 
 
 # locating -------------------------------------------------------------------------
@@ -74,15 +74,15 @@ def test_locate_bad_env(tmp_path):
 
 def test_spawn_hello_and_parent_pid(manager, fake_server, fake_env):
     with manager.session(fake_server) as s:
-        assert s.version == "1.0.0"
+        assert s.version == "2.0.0"
         assert s.has("control") and not s.has("release")
     argv = [p for m, p in recorded(fake_env) if m == "argv"][0]
     assert argv == ["--parent-pid", str(os.getpid())]
     hello = [p for m, p in recorded(fake_env) if m == "hello"][0]
-    assert hello == {"client": srv.CLIENT_NAME, "protocol_version": 1}
+    assert hello == {"client": srv.CLIENT_NAME, "protocol_version": 2}
     # stderr went to the log file
     with open(manager.log_path) as f:
-        assert "fake moss-server 1.0.0 starting" in f.read()
+        assert "fake moss-server 2.0.0 starting" in f.read()
 
 
 def test_one_process_reused_and_load_only_on_change(manager, fake_server, fake_env, tmp_path):
@@ -94,7 +94,7 @@ def test_one_process_reused_and_load_only_on_change(manager, fake_server, fake_e
         assert load(s, tmp_path) is False  # same config: no second load
         assert manager.running.proc.pid == pid
         s.run_job("generate", gen_params(tmp_path))
-        assert s.ensure_loaded({"model": str(tmp_path / "bundle"), "mode": "min_memory"}) is True
+        assert s.ensure_loaded({"model": str(tmp_path / "bundle"), "mode": "min_memory", "tier": "high"}) is True
     methods = [m for m, _ in recorded(fake_env)]
     assert methods.count("hello") == 1 and methods.count("load") == 2 and methods.count("generate") == 2
 
@@ -138,7 +138,7 @@ def test_invalid_params_message_is_the_servers(manager, fake_server, tmp_path):
 def test_load_error_leaves_no_engine(manager, fake_server, tmp_path):
     with manager.session(fake_server) as s:
         with pytest.raises(MossInferError) as e:
-            s.ensure_loaded({"model": str(tmp_path / "missing")})
+            s.ensure_loaded({"model": str(tmp_path / "missing"), "tier": "high"})
         assert e.value.code == "invalid_argument"
         with pytest.raises(MossInferError) as e:
             s.run_job("generate", gen_params(tmp_path))
@@ -311,7 +311,7 @@ def test_crash_then_restart(manager, fake_server, fake_env, tmp_path):
         assert load(s, tmp_path) is True  # the new process needs its own load
         assert s.run_job("generate", gen_params(tmp_path))["status"] == "ok"
     with open(manager.log_path) as f:
-        assert f.read().count("fake moss-server 1.0.0 starting") == 2
+        assert f.read().count("fake moss-server 2.0.0 starting") == 2
 
 
 def test_cuda_error_restarts_process(manager, fake_server, tmp_path):
@@ -348,14 +348,14 @@ def test_capability_gating_release(tmp_path, fake_server, fake_env):
             assert e.value.code == "not_supported" and "'release'" in str(e.value)
     finally:
         old.shutdown()
-    env = dict(fake_env, FAKE_MOSS_CAPS="preview,release,preload", FAKE_MOSS_VERSION="1.1.0")
+    env = dict(fake_env, FAKE_MOSS_CAPS="preview,tiers,release,preload")
     new = ServerManager(log_dir=str(tmp_path / "b"), env=env)
     try:
         with new.session(fake_server) as s:
             load(s, tmp_path)
             r = s.release(keep_host_copy=True)
             assert r["dit_host_copy"] is True and r["cancelled"] is False
-            assert s.ensure_loaded({"model": str(tmp_path / "bundle"), "mode": "balanced"}) is False  # engine kept
+            assert s.ensure_loaded({"model": str(tmp_path / "bundle"), "mode": "balanced", "tier": "high"}) is False  # engine kept
             done = s.run_job("preload", {"width": 64, "height": 64, "steps": 4})
             assert done["status"] == "ok" and "dit_load" in done
     finally:
@@ -364,7 +364,7 @@ def test_capability_gating_release(tmp_path, fake_server, fake_env):
 
 @pytest.fixture
 def release_manager(tmp_path, fake_env):
-    env = dict(fake_env, FAKE_MOSS_CAPS="preview,release", FAKE_MOSS_RELEASE_DELAY="5")
+    env = dict(fake_env, FAKE_MOSS_CAPS="preview,tiers,release", FAKE_MOSS_RELEASE_DELAY="5")
     m = ServerManager(log_dir=str(tmp_path / "r"), env=env)
     yield m
     m.shutdown()
@@ -390,7 +390,7 @@ def test_release_has_a_finite_timeout(release_manager, fake_server, tmp_path):
 
 
 def test_replaced_model_file_loads_again(manager, fake_server, fake_env, tmp_path):
-    params = {"model": str(tmp_path / "bundle"), "mode": "balanced"}
+    params = {"model": str(tmp_path / "bundle"), "mode": "balanced", "tier": "high"}
     (tmp_path / "bundle").mkdir()
     with manager.session(fake_server) as s:
         assert s.ensure_loaded(params, stamp=[("/d.safetensors", 1, 10)]) is True
@@ -407,54 +407,29 @@ def test_unload_then_load_again(manager, fake_server, fake_env, tmp_path):
     assert [m for m, _ in recorded(fake_env)].count("load") == 2
 
 
-def test_replaced_lora_reloads_the_engine(manager, fake_server, fake_env, tmp_path):
-    """Engines up to 1.0 key LoRAs and control adapters by path: a file replaced under the
-    same name needs a new engine (unload, load) before the next generate."""
+def test_replaced_lora_needs_no_reload(manager, fake_server, fake_env, tmp_path):
+    """MossInfer 2.0 reads a LoRA replaced under the same name anew: the engine stays loaded."""
     lora = tmp_path / "style.safetensors"
-    adapter = tmp_path / "control.safetensors"
     lora.write_bytes(b"one")
-    adapter.write_bytes(b"adapter")
-    params = {"model": str(tmp_path / "bundle"), "mode": "balanced"}
-    (tmp_path / "bundle").mkdir()
-
-    def run(s):
-        s.ensure_loaded(params, adapters=[str(lora), str(adapter)])
-        s.run_job("generate", gen_params(tmp_path, loras=[{"path": str(lora), "strength": 1.0}]))
-
-    def methods_since(n):
-        return [m for m, _ in recorded(fake_env)][n:]
-
     with manager.session(fake_server) as s:
-        run(s)
+        load(s, tmp_path)
+        s.run_job("generate", gen_params(tmp_path, loras=[{"path": str(lora), "strength": 1.0}]))
         n = len(recorded(fake_env))
-        run(s)  # unchanged: no reload
-        assert methods_since(n) == ["generate"]
-        n = len(recorded(fake_env))
-        lora.write_bytes(b"three")  # replaced under the same name
-        run(s)
-        assert methods_since(n) == ["unload", "load", "generate"]
-        n = len(recorded(fake_env))
-        run(s)  # the new stamp is recorded
-        assert methods_since(n) == ["generate"]
-        n = len(recorded(fake_env))
-        adapter.write_bytes(b"new adapter")
-        run(s)
-        assert methods_since(n) == ["unload", "load", "generate"]
-        # a load for another reason clears the record: nothing stale afterwards
-        assert s.ensure_loaded(dict(params, mode="min_memory"), adapters=[str(lora)]) is True
-        n = len(recorded(fake_env))
-        assert s.ensure_loaded(dict(params, mode="min_memory"), adapters=[str(lora), str(adapter)]) is False
-        assert methods_since(n) == []
+        lora.write_bytes(b"three")
+        assert load(s, tmp_path) is False
+        s.run_job("generate", gen_params(tmp_path, loras=[{"path": str(lora), "strength": 1.0}]))
+    assert [m for m, _ in recorded(fake_env)][n:] == ["generate"]
 
 
-@pytest.mark.parametrize("var,value,code,word", [("FAKE_MOSS_PROTOCOL", "2", "unsupported_protocol", "unsupported protocol"),
+@pytest.mark.parametrize("var,value,code,word", [("FAKE_MOSS_PROTOCOL", "1", "unsupported_protocol", "does not speak protocol 2"),
+                                                  ("FAKE_MOSS_HELLO_PROTOCOL", "3", "unsupported_protocol", "speaks protocol 3, not 2"),
                                                   ("FAKE_MOSS_ABI", "2", "abi_mismatch", "ABI 2")])
 def test_protocol_or_abi_mismatch(tmp_path, fake_server, fake_env, var, value, code, word):
     m = ServerManager(log_dir=str(tmp_path / "l"), env=dict(fake_env, **{var: value}))
     with pytest.raises(MossInferError) as e:
         with m.session(fake_server):
             pass
-    assert e.value.code == code and word in str(e.value)
+    assert e.value.code == code and word in str(e.value) and srv.NEEDS in str(e.value)
     assert m.running is None
 
 
@@ -534,7 +509,7 @@ def test_shutdown_during_job(manager, fake_server, fake_env, tmp_path):
 
 
 def test_progress_fraction_passthrough(tmp_path, fake_server, fake_env):
-    env = dict(fake_env, FAKE_MOSS_CAPS="preview,progress_fraction")
+    env = dict(fake_env, FAKE_MOSS_CAPS="preview,tiers,progress_fraction")
     m = ServerManager(log_dir=str(tmp_path / "l"), env=env)
     seen = []
     try:
@@ -552,7 +527,7 @@ def test_progress_fraction_passthrough(tmp_path, fake_server, fake_env):
 
 @pytest.fixture
 def inspect_env(fake_env):
-    return dict(fake_env, FAKE_MOSS_CAPS="preview,model_files,lora,tiers,control,inspect", FAKE_MOSS_VERSION="1.1.0",
+    return dict(fake_env, FAKE_MOSS_CAPS="preview,model_files,lora,tiers,control,inspect",
                 FAKE_MOSS_VALUES="1")
 
 
@@ -572,7 +547,7 @@ def test_inspect_results_and_errors(tmp_path, fake_server, inspect_env):
             assert s.request("status")["state"] == "unloaded"
     finally:
         m.shutdown()
-    assert r[dit]["kind"] == "dit" and r[dit]["tiers"] == ["auto", "high"] and r[dit]["path"] == dit
+    assert r[dit]["kind"] == "dit" and r[dit]["tiers"] == ["high"] and r[dit]["path"] == dit
     assert r[lora]["kind"] == "lora" and r[lora]["lora_rank"] == 16
     assert r[other]["kind"] == "unknown" and r[other]["loadable"] is False
     assert isinstance(r[str(tmp_path / "missing.safetensors")], MossInferError)
@@ -710,7 +685,7 @@ def test_inspect_cache(tmp_path, fake_server, inspect_env):
             fake_model_file(dit, dict(INT8_DIT, tiers=["high"]), tensors={"w": ("BF16", [2]), "x": ("BF16", [2])})
             assert s.inspect([dit, lora])[dit]["tiers"] == ["high"]  # replaced: inspected again
             assert inspected()[2:] == [dit]
-            m._hello = dict(m._hello, version="1.1.1")  # another engine version: nothing cached applies
+            m._hello = dict(m._hello, version="2.0.1")  # another engine version: nothing cached applies
             s.inspect([lora])
             assert inspected()[3:] == [lora]
             with open(fake_server, "a") as f:

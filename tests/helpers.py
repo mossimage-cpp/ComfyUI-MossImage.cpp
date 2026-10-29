@@ -110,17 +110,15 @@ def fake_model_file(path, inspect=None, tensors=None, metadata=None):
     return str(path)
 
 
-INT8_DIT = {"kind": "dit", "loadable": True, "precision": "int8", "quantization": "int8_convrot256",
-            "tiers": ["auto", "high"],
-            "tier_reasons": {"auto": "INT8 ConvRot GEMMs, exact attention, uncertified",
-                             "reference": "tier reference runs bf16 weights exactly, but the loaded DiT or text "
-                                          "encoder file is quantized; load the bundle's bf16 models or use tier high or auto",
-                             "high": "High tier: INT8 ConvRot GEMMs, q8_fp8 attention", "turbo": "the loaded DiT is INT8"}}
+Q8 = "8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8)"
+INT8_DIT = {"kind": "dit", "loadable": True, "precision": "int8", "quantization": "int8_convrot256", "tiers": ["high"],
+            "tier_reasons": {"reference": "tier reference runs bf16 weights exactly, but the loaded DiT or text "
+                                          "encoder file is quantized; load the bundle's bf16 models or use tier high",
+                             "high": f"High tier: INT8 ConvRot GEMMs, {Q8}", "turbo": "the loaded DiT is INT8"}}
 INT4_DIT = {"kind": "dit", "loadable": True, "precision": "w4a4", "quantization": "int4_convrot256", "tiers": ["turbo"],
-            "tier_reasons": {"auto": "no certificate covers it; choose tier turbo to run it uncertified",
-                             "reference": "the loaded DiT is quantized",
+            "tier_reasons": {"reference": "the loaded DiT is quantized",
                              "high": "the loaded DiT is INT4 ConvRot, which runs the Turbo tier; use tier turbo",
-                             "turbo": "Turbo tier: INT4 ConvRot GEMMs, q8_fp8 attention; uncertified"}}
+                             "turbo": f"Turbo tier: INT4 ConvRot GEMMs, {Q8}"}}
 LORA = {"kind": "lora", "loadable": True, "base_model": "", "adapter_types": ["lora"], "lora_rank": 16,
         "lora_adapters": 254, "lora_unknown_keys": 0}
 CONTROL = dict(LORA, kind="control_adapter", control_kinds=["color", "depth"], base_model="moss-base")

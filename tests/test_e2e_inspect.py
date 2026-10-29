@@ -1,6 +1,6 @@
-"""Headless ComfyUI with a fake moss-server that has `inspect` and hello `values` (MossInfer 1.1).
+"""Headless ComfyUI with a fake moss-server that has `inspect` and hello `values`.
 
-The checks run in Generate, before anything loads: a non-auto tier the DiT does not
+The checks run in Generate, before anything loads: a tier the DiT does not
 take, a file of the wrong kind in a slot, a LoRA the engine can't use, a control kind
 the adapter lacks, and a name the server's `values` don't list.
 """
@@ -46,7 +46,7 @@ def comfy(tmp_path_factory):
                FAKE_MOSS_RECORD=str(tmp / "requests.jsonl"), FAKE_MOSS_STEP_DELAY="0.01",
                FAKE_MOSS_CAPS="preview,model_files,lora,tiers,samplers,image_input,hires,control,accel,release,"
                               "progress_fraction,inspect",
-               FAKE_MOSS_VERSION="1.1.0", FAKE_MOSS_VALUES="1", FAKE_MOSS_VALUES_DROP="sampler:heun",
+               FAKE_MOSS_VALUES="1", FAKE_MOSS_VALUES_DROP="sampler:heun",
                FAKE_MOSS_INSPECT_DELAY="0.1")  # a file named slow_*: 1 s
     marker = tmp / "before-start"
     marker.write_text("")
@@ -91,13 +91,12 @@ def ok(comfy, prompt):
 def test_tier_the_dit_does_not_take(comfy):
     msg = run_error(comfy, workflow(comfy, 1, {"dit_file": "int8.safetensors", "tier": "reference"}))
     assert "dit_file int8.safetensors: " + INT8_DIT["tier_reasons"]["reference"] in msg
-    # INT4 with high: the header check lets it through at queue time; inspect refuses it
     msg = run_error(comfy, workflow(comfy, 2, {"dit_file": "int4.safetensors", "tier": "high"}))
     assert INT4_DIT["tier_reasons"]["high"] in msg
 
 
 def test_tiers_the_dit_takes(comfy):
-    ok(comfy, workflow(comfy, 3, {"dit_file": "int8.safetensors", "tier": "auto"}))
+    ok(comfy, workflow(comfy, 3, {"dit_file": "int8.safetensors", "tier": "high"}))
     ok(comfy, workflow(comfy, 4, {"dit_file": "int4.safetensors", "tier": "turbo"}))
 
 
@@ -142,7 +141,7 @@ def test_control_kinds(comfy):
 
 def test_name_the_server_lacks(comfy):
     msg = run_error(comfy, workflow(comfy, 12, sampler="heun"))
-    assert msg.rstrip("\n") == ("sampler 'heun' is not supported by this moss-server (1.1.0); it accepts: "
+    assert msg.rstrip("\n") == ("sampler 'heun' is not supported by this moss-server (2.0.0); it accepts: "
                                 "euler, ab2, euler_ancestral, dpmpp_2m, dpmpp_2m_sde, er_sde, res_multistep, dataspace")
     ok(comfy, workflow(comfy, 13, sampler="euler_ancestral"))
 
