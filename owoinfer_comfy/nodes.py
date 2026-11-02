@@ -15,22 +15,27 @@ from comfy_api.latest import ComfyExtension, io
 
 from . import logic
 from .imaging import load_image_tensor, load_preview, save_image_png, save_mask_png
-from .logic import FROM_FOLDER, ControlImage, MossControl, MossModel, ProgressMapper
+from .logic import FROM_FOLDER, ControlImage, MossControl, MossModel, MossReferences, ProgressMapper
 from .server import MossInferError, ServerManager, locate_server
 
-log = logging.getLogger("owoinfer")
+log = logging.getLogger("mossimage_cpp")
 
-PACK = "ComfyUI-MossImage-owoinfer"
-CATEGORY = "MOSS-Image (owoinfer)"
+PACK = "ComfyUI-MossImage.cpp"
+CATEGORY = "MOSS-Image (mossimage.cpp)"
 MODEL_FOLDER = "moss_image"
+GGUF_FOLDER = "moss_image_gguf"
 
 MossModelType = io.Custom("MOSS_MODEL")
 MossControlType = io.Custom("MOSS_CONTROL")
+MossReferencesType = io.Custom("MOSS_REFERENCES")
 
 
 def register_model_folder() -> None:
     """models/moss_image/ for bundle folders; extra_model_paths.yaml can add more (`moss_image: <dir>`)."""
     folder_paths.add_model_folder_path(MODEL_FOLDER, os.path.join(folder_paths.models_dir, MODEL_FOLDER), is_default=True)
+    # .gguf files in diffusion_models, under a key of their own so ComfyUI's loaders don't list them.
+    # The same paths list object, so extra_model_paths.yaml entries count too.
+    folder_paths.folder_names_and_paths[GGUF_FOLDER] = (folder_paths.folder_names_and_paths["diffusion_models"][0], {".gguf"})
 
 
 _manager: ServerManager | None = None
@@ -47,6 +52,11 @@ def get_manager() -> ServerManager:
 
 def _bundles() -> dict[str, str]:
     return logic.find_bundles(folder_paths.get_folder_paths(MODEL_FOLDER))
+
+
+def _dit_folder(name: str) -> str:
+    """The folder key of a `dit_file` choice."""
+    return GGUF_FOLDER if name.lower().endswith(".gguf") else "diffusion_models"
 
 
 def _file_choice(folder: str, name: str) -> str:
@@ -74,10 +84,10 @@ class ModelLoader(io.ComfyNode):
     def define_schema(cls) -> io.Schema:
         bundles = list(_bundles()) or [logic.NO_BUNDLE]
         return io.Schema(
-            node_id="OwoInferMossImageModelLoader",
+            node_id="MossImageCppModelLoader",
             display_name="MOSS-Image Model Loader",
             category=CATEGORY,
-            description="Picks a MOSS-Image model for owoinfer (MossInfer). The engine runs in its own process "
+            description="Picks a MOSS-Image model for mossimage.cpp. The engine runs in its own process "
                         "(moss-server), shared by every node; it loads the model on the first run.",
             inputs=[
                 io.Combo.Input("model_folder", options=bundles,
@@ -85,7 +95,8 @@ class ModelLoader(io.ComfyNode):
                                        "It supplies the tokenizer and configs, and the components not replaced below."),
                 io.Combo.Input("dit_file", options=cls._dit_options(), default=FROM_FOLDER,
                                tooltip="A single-file DiT (ComfyUI / community INT8 ConvRot, INT4 ConvRot, NVFP4, bf16) "
-                                       "from diffusion_models."),
+                                       "from diffusion_models, or a GGUF there, which the engine converts once at "
+                                       "its first load."),
                 io.Combo.Input("text_encoder_file", options=[FROM_FOLDER] + folder_paths.get_filename_list("text_encoders"),
                                default=FROM_FOLDER,
                                tooltip="A single-file Qwen3.5-9B text encoder (INT8 ConvRot or W4A8) from text_encoders."),
@@ -108,13 +119,14 @@ class ModelLoader(io.ComfyNode):
 
     @staticmethod
     def _dit_options() -> list[str]:
-        return [FROM_FOLDER] + folder_paths.get_filename_list("diffusion_models")
+        return [FROM_FOLDER] + sorted(folder_paths.get_filename_list("diffusion_models")
+                                     + folder_paths.get_filename_list(GGUF_FOLDER))
 
     @classmethod
     def fingerprint_inputs(cls, model_folder, dit_file, text_encoder_file, vae_file, **kwargs):
         path = _bundles().get(model_folder)
         return (tuple(logic.bundle_stamp(path)) if path else None,
-                _stamp_of("diffusion_models", dit_file), _stamp_of("text_encoders", text_encoder_file),
+                _stamp_of(_dit_folder(dit_file), dit_file), _stamp_of("text_encoders", text_encoder_file),
                 _stamp_of("vae", vae_file))
 
     @classmethod
@@ -125,7 +137,7 @@ class ModelLoader(io.ComfyNode):
             raise ValueError(f"MOSS-Image folder {model_folder!r} not found in "
                              f"{', '.join(folder_paths.get_folder_paths(MODEL_FOLDER))}")
         return io.NodeOutput(MossModel(
-            model_dir=bundles[model_folder], dit_file=_file_choice("diffusion_models", dit_file),
+            model_dir=bundles[model_folder], dit_file=_file_choice(_dit_folder(dit_file), dit_file),
             text_encoder_file=_file_choice("text_encoders", text_encoder_file),
             vae_file=_file_choice("vae", vae_file), mode=mode, tier=tier, attention=attention))
 
@@ -134,7 +146,7 @@ class LoRA(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="OwoInferMossImageLoRA",
+            node_id="MossImageCppLoRA",
             display_name="MOSS-Image LoRA",
             category=CATEGORY,
             description="Adds a LoRA (kohya, PEFT / diffusers, LyCORIS LoHa / LoKr, full deltas) to a MOSS-Image model. "
@@ -162,7 +174,7 @@ class Control(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="OwoInferMossImageControl",
+            node_id="MossImageCppControl",
             display_name="MOSS-Image Control",
             category=CATEGORY,
             description="A control adapter (e.g. MOSS-Image color / depth control) with one conditioning image. "
@@ -204,14 +216,44 @@ class Control(io.ComfyNode):
         return io.NodeOutput(control.with_image(ControlImage(kind.strip(), image, strength, start, end)))
 
 
+class Reference(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="MossImageCppReference",
+            display_name="MOSS-Image Reference",
+            category=CATEGORY,
+            description="A reference image for an edit adapter loaded with MOSS-Image LoRA. Chain up to four; the "
+                        "first node of the chain is the source image.",
+            inputs=[
+                io.Image.Input("image", tooltip="The reference image (the first of a batch)."),
+                io.Int.Input("max_edge", default=512, min=16, max=2048, step=16,
+                             tooltip="Each image is fit within this size; the same on every node of a chain."),
+                MossReferencesType.Input("references", optional=True, tooltip="The images before this one."),
+            ],
+            outputs=[MossReferencesType.Output(display_name="references")],
+        )
+
+    @classmethod
+    def execute(cls, image, max_edge, references=None) -> io.NodeOutput:
+        if references is None:
+            references = MossReferences(max_edge)
+        elif references.max_edge != max_edge:
+            raise ValueError(f"chained MOSS-Image Reference nodes must use the same max_edge "
+                             f"({references.max_edge} and {max_edge}): the engine takes one per run")
+        if image.shape[0] > 1:
+            log.warning("MOSS-Image Reference: image is a batch of %d; using the first", image.shape[0])
+        return io.NodeOutput(references.with_image(image))
+
+
 class Generate(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="OwoInferMossImageGenerate",
+            node_id="MossImageCppGenerate",
             display_name="MOSS-Image Generate",
             category=CATEGORY,
-            description="Generates an image with owoinfer (moss-server). Optional init image and mask for img2img "
+            description="Generates an image with mossimage.cpp (moss-server). Optional init image and mask for img2img "
                         "and inpainting.",
             inputs=[
                 MossModelType.Input("moss_model"),
@@ -230,6 +272,8 @@ class Generate(io.ComfyNode):
                 io.Mask.Input("mask", optional=True,
                               tooltip="Inpainting: 1 repaints, 0 keeps (the first of a batch). The init image's size."),
                 MossControlType.Input("control", optional=True),
+                MossReferencesType.Input("references", optional=True,
+                                         tooltip="Reference images for an edit adapter, from MOSS-Image Reference."),
                 io.Float.Input("denoise_strength", default=0.75, min=0.0, max=1.0, step=0.01,
                                tooltip="With an init image: the share of the schedule run from it."),
                 io.Combo.Input("resize", options=logic.RESIZE_MODES, default="crop",
@@ -268,6 +312,12 @@ class Generate(io.ComfyNode):
                                        "in RAM for a fast reload. unload: everything freed."),
                 io.Boolean.Input("free_comfy_vram", default=True, advanced=True,
                                  tooltip="Unload ComfyUI's own models first, so they and the engine do not both hold VRAM."),
+                # Last and optional: saved workflows store widget values by position, and API prompts omit it.
+                io.Combo.Input("lora_placement", options=logic.LORA_PLACEMENTS, default="default", optional=True, advanced=True,
+                               tooltip="Where low-rank adapters go. default: the side branch, or merged for an edit "
+                                       "adapter on bf16. merge: into the DiT at load (INT8 is requantized). "
+                                       "side_branch: a cost per step, instant strength changes. Changing what is "
+                                       "merged reloads the DiT."),
             ],
             outputs=[io.Image.Output(display_name="image")],
             hidden=[io.Hidden.unique_id],
@@ -275,7 +325,7 @@ class Generate(io.ComfyNode):
 
     @classmethod
     def execute(cls, moss_model: MossModel, init_image=None, mask=None, control: MossControl | None = None,
-                **values: Any) -> io.NodeOutput:
+                references: MossReferences | None = None, **values: Any) -> io.NodeOutput:
         server_path = locate_server()
         if values.get("free_comfy_vram", True):
             mm.unload_all_models()
@@ -308,6 +358,12 @@ class Generate(io.ComfyNode):
                 for image, path in zip(control.images, paths):
                     save_image_png(image.image, path)
                 control_param = control.to_param(paths)
+            references_param = None
+            if references is not None:
+                paths = [tmp(f"reference{i}") for i in range(len(references.images))]
+                for image, path in zip(references.images, paths):
+                    save_image_png(image, path)
+                references_param = references.to_param(paths)
             previews = values.get("preview", True) and args.preview_method != LatentPreviewMethod.NoPreviews
 
             manager = get_manager()
@@ -318,7 +374,8 @@ class Generate(io.ComfyNode):
                     raise logic.missing_capability("after_run release", "release", s.version)
                 params = logic.build_generate_params(
                     values, caps, s.version, output=tmp("out"), preview_output=tmp("preview") if previews else None,
-                    init_image=init_path, mask=mask_path, loras=moss_model.loras, control=control_param)
+                    init_image=init_path, mask=mask_path, loras=moss_model.loras, control=control_param,
+                    references=references_param)
                 load_params = moss_model.load_params(caps, s.version, manager.cache_dir)
                 # Before any load: names this server lacks, and files it can't use in their slot.
                 problems = logic.value_problems(s.values, load_params, params, s.version)
@@ -414,4 +471,4 @@ class Generate(io.ComfyNode):
 
 class OwoInferExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
-        return [ModelLoader, LoRA, Control, Generate]
+        return [ModelLoader, LoRA, Control, Reference, Generate]

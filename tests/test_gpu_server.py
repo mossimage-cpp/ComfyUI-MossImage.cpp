@@ -1,19 +1,20 @@
 """GPU tests of the server manager with the real moss-server (no ComfyUI).
 
-Opt-in with OWOINFER_GPU_TESTS=1, under the GPU lock; 256x256, 2 to 4 steps.
+Opt-in with MOSSIMAGE_CPP_GPU_TESTS=1, under the GPU lock; 256x256, 2 to 4 steps.
 """
 
 import os
 import shutil
 import signal
 
+import numpy as np
 import pytest
 from PIL import Image
 
-from helpers import DIT_INT8, GPU_SERVER, SFT, TE_INT8, gpu_skip_reason
+from helpers import DIT_INT8, EDIT_ADAPTER, GGUF_Q8, GPU_SERVER, SFT, TE_INT8, gpu_skip_reason
 from owoinfer_comfy import logic
 from owoinfer_comfy.imaging import load_preview
-from owoinfer_comfy.logic import MossModel
+from owoinfer_comfy.logic import MossModel, MossReferences
 from owoinfer_comfy.server import ServerCrashed, ServerManager
 
 pytestmark = pytest.mark.gpu
@@ -131,3 +132,64 @@ def test_release_then_generate(manager):
     assert done["status"] == "ok"
     if r["dit_host_copy"]:
         assert done["report"]["dit_load"]["source"] == "host_copy"
+
+
+def test_edit_adapter_with_references(manager):
+    if not os.path.isfile(EDIT_ADAPTER):
+        pytest.skip(f"model file not on this machine: {EDIT_ADAPTER}")
+    paths = [str(manager.tmp / "ref0.png"), str(manager.tmp / "ref1.png")]
+    Image.effect_noise((128, 96), 64).convert("RGB").save(paths[0])
+    Image.linear_gradient("L").resize((96, 128)).convert("RGB").save(paths[1])
+    refs = MossReferences(128).with_image(None).with_image(None).to_param(paths)
+    m = model().with_lora(EDIT_ADAPTER, 1.0)
+    out = manager.tmp / "edit.png"
+    with manager.session(GPU_SERVER) as s:
+        if not s.has("references"):
+            pytest.skip(f"moss-server {s.version} is older than 2.1: no reference images")
+        s.ensure_loaded(m.load_params(s.capabilities, s.version, manager.cache_dir))
+        p = logic.build_generate_params(params(manager.tmp, steps=2, lora_placement="side_branch"), s.capabilities, s.version,
+                                        output=str(out), loras=m.loras, references=refs)
+        done = s.run_job("generate", p)
+        s.unload()
+    assert done["status"] == "ok", done
+    report = done["report"]["references"]
+    assert report["count"] == 2 and report["max_edge"] == 128, report
+    assert not done["warnings"], done["warnings"]
+    with Image.open(out) as img:
+        assert img.size == (256, 256)
+
+
+def test_gguf_dit(manager):
+    """A GGUF DiT: its first load converts into <cache>/gguf/ (5.4 GB), later loads find the file."""
+    cache = os.environ.get("MOSS_TEST_CACHE", "")
+    if not cache:
+        pytest.skip("converting a GGUF writes 5.4 GB and /tmp may be tmpfs: set MOSS_TEST_CACHE to a folder with room")
+    if not os.path.isfile(GGUF_Q8):
+        pytest.skip(f"model file not on this machine: {GGUF_Q8}")
+    folder = os.path.join(cache, "gguf")
+    fresh = not (os.path.isdir(folder) and os.listdir(folder))
+    m = MossModel(SFT, dit_file=GGUF_Q8, text_encoder_file=TE_INT8)
+    label = "converting GGUF DiT (first load)"
+    texts: list[list[str]] = []
+    with manager.session(GPU_SERVER) as s:
+        if not s.has("references"):
+            pytest.skip(f"moss-server {s.version} is older than 2.1: no GGUF DiTs")
+        for i in range(2):
+            s.ensure_loaded(m.load_params(s.capabilities, s.version, cache))
+            run: list[str] = []
+            texts.append(run)
+            out = manager.tmp / f"gguf{i}.png"
+            p = logic.build_generate_params(params(manager.tmp, steps=2), s.capabilities, s.version, output=str(out))
+
+            def on_event(e, run=run):
+                run.append(logic.progress_text(e) if e["event"] == "progress" else e["event"])
+
+            done = s.run_job("generate", p, on_event=on_event)
+            assert done["status"] == "ok", done
+            s.unload()
+            with Image.open(out) as img:
+                assert np.asarray(img.convert("RGB"), dtype=np.float32).std() > 0.05 * 255, "a flat image"
+    assert os.listdir(folder)
+    if fresh:
+        assert label in texts[0] and texts[0].index(label) < texts[0].index("plan")
+    assert label not in texts[1]

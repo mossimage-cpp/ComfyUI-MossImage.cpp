@@ -22,7 +22,9 @@ pytestmark = pytest.mark.e2e
 if comfyui_missing():
     pytest.skip(comfyui_missing(), allow_module_level=True)
 
-NODE_IDS = ["OwoInferMossImageModelLoader", "OwoInferMossImageLoRA", "OwoInferMossImageControl", "OwoInferMossImageGenerate"]
+NODE_IDS = ["MossImageCppModelLoader", "MossImageCppLoRA", "MossImageCppControl",
+            "MossImageCppReference", "MossImageCppGenerate"]
+PACK_DIR = "ComfyUI-MossImage.cpp"
 
 
 @pytest.fixture(scope="module")
@@ -41,11 +43,15 @@ def comfy(tmp_path_factory):
     write_safetensors(os.path.join(dits, "test_int4.safetensors"), {"layers.0.proj.q.weight": ("I8", [4])},
                       metadata={"_quantization_metadata": json.dumps(
                           {"layers": {"layers.0.proj.q": {"format": "convrot_w4a4"}}})})
+    with open(os.path.join(dits, "test_q8.gguf"), "wb") as f:
+        f.write(b"GGUF")
+    os.makedirs(tmp / "extra" / "dits")
+    (tmp / "extra" / "dits" / "extra_q4.gguf").write_bytes(b"GGUF")
     yaml = tmp / "extra_model_paths.yaml"
-    yaml.write_text(f"owoinfer_e2e:\n  base_path: {tmp / 'extra'}\n  moss_image: bundles\n")
+    yaml.write_text(f"mossimage_e2e:\n  base_path: {tmp / 'extra'}\n  moss_image: bundles\n  diffusion_models: dits\n")
     if install_extra_paths():
         warnings.warn(f"ComfyUI also reads {install_extra_paths()}; its folders appear in these tests", stacklevel=2)
-    env = dict(os.environ, MOSSINFER_SERVER=make_fake_server(str(tmp / "bin")),
+    env = dict(os.environ, MOSSIMAGE_CPP_SERVER=make_fake_server(str(tmp / "bin")),
                FAKE_MOSS_RECORD=str(tmp / "requests.jsonl"), FAKE_MOSS_STEP_DELAY="0.02")
     marker = tmp / "before-start"
     marker.write_text("")
@@ -61,7 +67,7 @@ def comfy(tmp_path_factory):
 
 def small(prompt, **gen):
     p = copy.deepcopy(prompt)
-    inputs = find(p, "OwoInferMossImageGenerate")
+    inputs = find(p, "MossImageCppGenerate")
     inputs.update({"width": 64, "height": 48, "steps": 4})
     inputs.update(gen)
     return p
@@ -74,14 +80,14 @@ def generate_requests(comfy):
 def test_nodes_registered(comfy):
     info = comfy.get("/object_info")
     for node_id in NODE_IDS:
-        assert info[node_id]["category"] == "MOSS-Image (owoinfer)"
-    assert info["OwoInferMossImageModelLoader"]["display_name"] == "MOSS-Image Model Loader"
-    assert info["OwoInferMossImageModelLoader"]["output"] == ["MOSS_MODEL"]
-    folders = info["OwoInferMossImageModelLoader"]["input"]["required"]["model_folder"]
+        assert info[node_id]["category"] == "MOSS-Image (mossimage.cpp)"
+    assert info["MossImageCppModelLoader"]["display_name"] == "MOSS-Image Model Loader"
+    assert info["MossImageCppModelLoader"]["output"] == ["MOSS_MODEL"]
+    folders = info["MossImageCppModelLoader"]["input"]["required"]["model_folder"]
     options = folders[1]["options"] if folders[0] == "COMBO" else folders[0]
     # models/moss_image/ and the extra_model_paths.yaml folder
     assert "MOSS-Image-SFT" in options and "Extra-Bundle" in options
-    after_run = info["OwoInferMossImageGenerate"]["input"]["required"]["after_run"]
+    after_run = info["MossImageCppGenerate"]["input"]["required"]["after_run"]
     options = after_run[1]["options"] if after_run[0] == "COMBO" else after_run[0]
     assert options == ["keep", "release", "unload"]  # always listed; checked against the server at run time
     # nothing spawned moss-server at import or schema time
@@ -103,20 +109,20 @@ def test_example_workflow_makes_an_image(comfy):
     assert sent["preview_every"] == 1 and "init_image" not in sent
     load = [p for m, p in recorded(comfy.env) if m == "load"]
     assert len(load) == 1 and load[0]["model"].endswith(os.path.join("moss_image", "MOSS-Image-SFT"))
-    assert load[0]["tier"] == "high" and load[0]["cache_dir"].endswith(os.path.join("ComfyUI-MossImage-owoinfer", "cache"))
+    assert load[0]["tier"] == "high" and load[0]["cache_dir"].endswith(os.path.join(PACK_DIR, "cache"))
     # the job's temp files are gone
-    assert os.listdir(os.path.join(comfy.base, "temp", "ComfyUI-MossImage-owoinfer")) == []
+    assert os.listdir(os.path.join(comfy.base, "temp", PACK_DIR)) == []
     assert "MOSS-Image: seed 42" in comfy.log()
 
 
 def test_lora_chain_and_img2img(comfy):
     prompt = small(load_workflow_prompt(comfy), seed=5, denoise_strength=0.5)
-    prompt["10"] = {"class_type": "OwoInferMossImageLoRA",
+    prompt["10"] = {"class_type": "MossImageCppLoRA",
                     "inputs": {"moss_model": ["1", 0], "lora_name": "test_lora.safetensors", "strength": 0.8}}
-    prompt["11"] = {"class_type": "OwoInferMossImageLoRA",
+    prompt["11"] = {"class_type": "MossImageCppLoRA",
                     "inputs": {"moss_model": ["10", 0], "lora_name": "test_lora.safetensors", "strength": 0.3}}
     prompt["12"] = {"class_type": "LoadImage", "inputs": {"image": "init.png"}}
-    gen = find(prompt, "OwoInferMossImageGenerate")
+    gen = find(prompt, "MossImageCppGenerate")
     gen["moss_model"] = ["11", 0]
     gen["init_image"] = ["12", 0]
     entry = comfy.wait_history(comfy.queue(prompt))
@@ -143,11 +149,11 @@ def test_after_run_unload(comfy):
 def test_after_run_release_needs_the_capability(comfy):
     entry = comfy.wait_history(comfy.queue(small(load_workflow_prompt(comfy), seed=23, after_run="release")))
     errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
-    assert "after_run release needs a moss-server with the 'release' capability; this one (2.0.0)" in errors[0]["exception_message"]
+    assert "after_run release needs a moss-server with the 'release' capability; this one (2.1.1)" in errors[0]["exception_message"]
 
 
 def loader(prompt, **kw):
-    find(prompt, "OwoInferMossImageModelLoader").update(kw)
+    find(prompt, "MossImageCppModelLoader").update(kw)
     return prompt
 
 
@@ -167,10 +173,10 @@ def test_linked_tier_is_checked_by_the_server(comfy):
     prompt = loader(small(load_workflow_prompt(comfy), seed=29), dit_file="test_int4.safetensors")
     # ComfyUI's If/Else Switch passes any type through, so it can feed a combo input
     prompt["30"] = {"class_type": "ComfySwitchNode", "inputs": {"switch": True, "on_true": "auto", "on_false": "auto"}}
-    find(prompt, "OwoInferMossImageModelLoader")["tier"] = ["30", 0]
+    find(prompt, "MossImageCppModelLoader")["tier"] = ["30", 0]
     entry = comfy.wait_history(comfy.queue(prompt))  # accepted: nothing to check before it runs
     errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
-    assert errors and errors[0]["node_type"] == "OwoInferMossImageGenerate"
+    assert errors and errors[0]["node_type"] == "MossImageCppGenerate"
     assert '"tier" must be one of high, reference, turbo' in errors[0]["exception_message"]
     prompt["30"]["inputs"]["on_true"] = "turbo"
     entry = comfy.wait_history(comfy.queue(prompt))
@@ -198,6 +204,106 @@ def test_replaced_file_runs_again(comfy):
     assert comfy.wait_history(comfy.queue(prompt))["status"]["status_str"] == "success"
     methods = [m for m, _ in recorded(comfy.env)][len(before):]
     assert methods == ["load", "generate"]  # the loader ran again, and the engine loaded the new file
+
+
+def combo_options(info, node_id, name):
+    spec = info[node_id]["input"]["required"][name]
+    return spec[1]["options"] if spec[0] == "COMBO" else spec[0]
+
+
+def test_gguf_is_offered_by_the_loader_only(comfy):
+    info = comfy.get("/object_info")
+    offered = combo_options(info, "MossImageCppModelLoader", "dit_file")
+    assert offered[0] == "(from folder)" and offered[1:] == sorted(offered[1:])
+    # models/diffusion_models/ and the extra_model_paths.yaml folder
+    assert "test_q8.gguf" in offered and "extra_q4.gguf" in offered and "test_int4.safetensors" in offered
+    native = combo_options(info, "UNETLoader", "unet_name")
+    assert "test_int4.safetensors" in native
+    assert not [name for name in native if name.endswith(".gguf")]
+
+
+def test_gguf_reaches_the_server(comfy):
+    prompt = loader(small(load_workflow_prompt(comfy), seed=33), dit_file="extra_q4.gguf")
+    entry = comfy.wait_history(comfy.queue(prompt))
+    assert entry["status"]["status_str"] == "success", entry["status"]
+    load = [p for m, p in recorded(comfy.env) if m == "load"][-1]
+    assert load["dit_file"].endswith(os.path.join("extra", "dits", "extra_q4.gguf"))
+    assert load["cache_dir"].endswith(os.path.join(PACK_DIR, "cache"))
+
+
+def test_replaced_gguf_runs_again(comfy):
+    prompt = loader(small(load_workflow_prompt(comfy), seed=34), dit_file="test_q8.gguf")
+    comfy.wait_history(comfy.queue(prompt))
+    before = recorded(comfy.env)
+    assert comfy.wait_history(comfy.queue(prompt))["status"]["status_str"] == "success"
+    assert recorded(comfy.env) == before
+    with open(os.path.join(comfy.base, "models", "diffusion_models", "test_q8.gguf"), "ab") as f:
+        f.write(b"\0" * 8)
+    assert comfy.wait_history(comfy.queue(prompt))["status"]["status_str"] == "success"
+    assert [m for m, _ in recorded(comfy.env)][len(before):] == ["load", "generate"]
+
+
+def with_references(prompt, *sizes, max_edges=None):
+    """A chain of Reference nodes on EmptyImage, one per (width, height, batch), into Generate."""
+    last = None
+    for i, (width, height, batch) in enumerate(sizes):
+        prompt[str(50 + i)] = {"class_type": "EmptyImage",
+                               "inputs": {"width": width, "height": height, "batch_size": batch, "color": 0}}
+        node = {"image": [str(50 + i), 0], "max_edge": (max_edges or [256] * len(sizes))[i]}
+        if last is not None:
+            node["references"] = [last, 0]
+        last = str(60 + i)
+        prompt[last] = {"class_type": "MossImageCppReference", "inputs": node}
+    find(prompt, "MossImageCppGenerate")["references"] = [last, 0]
+    return prompt
+
+
+def test_reference_chain(comfy):
+    prompt = with_references(small(load_workflow_prompt(comfy), seed=35), (96, 64, 1), (32, 48, 1))
+    entry = comfy.wait_history(comfy.queue(prompt))
+    assert entry["status"]["status_str"] == "success", entry["status"]
+    sent = generate_requests(comfy)[-1]
+    assert sent["references"]["max_edge"] == 256 and sent["lora_placement"] == "default"
+    assert [os.path.basename(p).split("-", 1)[1] for p in sent["references"]["images"]] == ["reference0.png", "reference1.png"]
+    # upstream first, each image re-encoded to a PNG the server could read during the run
+    assert [p for m, p in recorded(comfy.env) if m == "references_seen"][-1]["sizes"] == [[96, 64], [32, 48]]
+    assert os.listdir(os.path.join(comfy.base, "temp", PACK_DIR)) == []
+
+
+def test_reference_batch_uses_the_first(comfy):
+    prompt = with_references(small(load_workflow_prompt(comfy), seed=36), (48, 48, 2))
+    entry = comfy.wait_history(comfy.queue(prompt))
+    assert entry["status"]["status_str"] == "success", entry["status"]
+    assert [p for m, p in recorded(comfy.env) if m == "references_seen"][-1]["sizes"] == [[48, 48]]
+    assert "MOSS-Image Reference: image is a batch of 2; using the first" in comfy.log()
+
+
+def test_reference_chain_must_agree_on_max_edge(comfy):
+    prompt = with_references(small(load_workflow_prompt(comfy), seed=37), (48, 48, 1), (32, 32, 1), max_edges=[256, 512])
+    entry = comfy.wait_history(comfy.queue(prompt))
+    errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
+    assert "chained MOSS-Image Reference nodes must use the same max_edge (256 and 512)" in errors[0]["exception_message"]
+
+
+def test_too_many_references(comfy):
+    prompt = with_references(small(load_workflow_prompt(comfy), seed=38), *[(16 * (i + 1), 16, 1) for i in range(5)])
+    entry = comfy.wait_history(comfy.queue(prompt))
+    errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
+    assert "too many reference images: the engine takes at most 4" in errors[0]["exception_message"]
+
+
+def test_workflow_saved_without_lora_placement(comfy):
+    """The example workflow predates it: it has no widget value, and the API prompt no input."""
+    info = comfy.get("/object_info")["MossImageCppGenerate"]
+    assert info["input_order"]["optional"][-1] == "lora_placement"
+    assert "lora_placement" not in info["input"]["required"]
+    assert "lora_placement" not in find(load_workflow_prompt(comfy), "MossImageCppGenerate")
+    entry = comfy.wait_history(comfy.queue(small(load_workflow_prompt(comfy), seed=39)))
+    assert entry["status"]["status_str"] == "success", entry["status"]
+    assert generate_requests(comfy)[-1]["lora_placement"] == "default"
+    entry = comfy.wait_history(comfy.queue(small(load_workflow_prompt(comfy), seed=40, lora_placement="side_branch")))
+    assert entry["status"]["status_str"] == "success", entry["status"]
+    assert generate_requests(comfy)[-1]["lora_placement"] == "side_branch"
 
 
 def test_preview_method_none_sends_no_preview(comfy):
@@ -247,7 +353,7 @@ def comfy_release(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("e2e-fake-release")
     base = make_base(str(tmp / "base"))
     make_bundle(os.path.join(base, "models", "moss_image", "MOSS-Image-SFT"))
-    env = dict(os.environ, MOSSINFER_SERVER=make_fake_server(str(tmp / "bin")),
+    env = dict(os.environ, MOSSIMAGE_CPP_SERVER=make_fake_server(str(tmp / "bin")),
                FAKE_MOSS_RECORD=str(tmp / "requests.jsonl"), FAKE_MOSS_STEP_DELAY="0.02",
                FAKE_MOSS_CAPS="preview,model_files,lora,tiers,samplers,image_input,release",
                FAKE_MOSS_RELEASE_DELAY="0.5")
@@ -281,6 +387,22 @@ def test_release_after_a_normal_run(comfy_release):
     entry = c.wait_history(c.queue(small(load_workflow_prompt(c), seed=32, after_run="release")))
     assert entry["status"]["status_str"] == "success"
     assert [m for m, _ in recorded(c.env)][-2:] == ["generate", "release"]
+
+
+def test_references_need_the_capability(comfy_release):
+    c = comfy_release
+    prompt = with_references(small(load_workflow_prompt(c), seed=41), (48, 48, 1))
+    entry = c.wait_history(c.queue(prompt))
+    errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
+    assert errors and ("A reference image needs a moss-server with the 'references' capability; this one (2.1.1) "
+                       "does not have it") in errors[0]["exception_message"]
+    assert os.listdir(os.path.join(c.base, "temp", PACK_DIR)) == []
+    # at its default it is left out, and such a server takes the request
+    assert c.wait_history(c.queue(small(load_workflow_prompt(c), seed=42)))["status"]["status_str"] == "success"
+    assert "lora_placement" not in [p for m, p in recorded(c.env) if m == "generate"][-1]
+    entry = c.wait_history(c.queue(small(load_workflow_prompt(c), seed=43, lora_placement="merge")))
+    errors = [m[1] for m in entry["status"]["messages"] if m[0] == "execution_error"]
+    assert "lora_placement 'merge' needs a moss-server with the 'references' capability" in errors[0]["exception_message"]
 
 
 def test_nothing_written_into_the_install(comfy):

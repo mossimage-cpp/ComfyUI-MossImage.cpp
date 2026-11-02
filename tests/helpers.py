@@ -52,6 +52,8 @@ DIT_INT8 = os.path.join(COMFY_ORG, "moss_image_sft_int8_convrot.safetensors")
 TE_INT8 = os.path.join(COMFY_ORG, "qwen3.5_9b_int8_convrot.safetensors")
 VAE_FULL = os.path.join(COMFY_ORG, "flux2-vae.safetensors")
 LORA_4STEP = os.path.join(MODELS, "community", "akhaliq", "MOSS-Image-SFT-4-steps", "lora.safetensors")
+GGUF_Q8 = os.path.join(MODELS, "community", "gguf", "leejet", "MOSS-Image-SFT-GGUF", "MOSS-Image-SFT-Q8_0.gguf")
+EDIT_ADAPTER = os.path.join(MODELS, "community", "chinoll", "Moss-Image-Edit", "adapter_model.safetensors")
 MIN_FREE_RAM_GIB = 10
 
 
@@ -59,8 +61,8 @@ def gpu_skip_reason(server=GPU_SERVER, files=(SFT, DIT_INT8, TE_INT8)):
     """Why the GPU tests cannot run here, or "". Never touches other processes."""
     import shutil
     import subprocess
-    if os.environ.get("OWOINFER_GPU_TESTS") != "1":
-        return "GPU tests are opt-in: set OWOINFER_GPU_TESTS=1 (run under the GPU lock)"
+    if os.environ.get("MOSSIMAGE_CPP_GPU_TESTS") != "1":
+        return "GPU tests are opt-in: set MOSSIMAGE_CPP_GPU_TESTS=1 (run under the GPU lock)"
     if not shutil.which("nvidia-smi"):
         return "no nvidia-smi: no NVIDIA GPU"
     try:

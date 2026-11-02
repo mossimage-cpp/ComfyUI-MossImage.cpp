@@ -20,6 +20,16 @@ def test_image_round_trip(tmp_path):
     assert torch.max(torch.abs(back - image)) <= 0.5 / 255 + 1e-6
 
 
+def test_image_batch_saves_its_first_frame(tmp_path):
+    """Reference and Control hand on the whole batch: the first frame is the one sent."""
+    batch = torch.zeros(2, 4, 4, 3)
+    batch[0, ..., 0] = 1.0  # red
+    batch[1, ..., 2] = 1.0  # blue
+    save_image_png(batch, str(tmp_path / "b.png"))
+    with Image.open(tmp_path / "b.png") as img:
+        assert img.getpixel((0, 0)) == (255, 0, 0)
+
+
 def test_image_alpha_and_gray(tmp_path):
     rgba = torch.zeros(8, 8, 4)
     rgba[..., 0] = 1.0

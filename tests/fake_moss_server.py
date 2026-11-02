@@ -8,7 +8,7 @@ preload/release, and failure modes chosen by the prompt.
 Environment:
   FAKE_MOSS_CAPS        comma-separated capabilities that are true (default: a reduced build, so
                         the capability gates the protocol asks clients to keep are exercised)
-  FAKE_MOSS_VERSION     the version in hello (default 2.0.0)
+  FAKE_MOSS_VERSION     the version in hello (default 2.1.1)
   FAKE_MOSS_PROTOCOL    the protocol it speaks (default 2); a hello asking for another is refused
   FAKE_MOSS_HELLO_PROTOCOL the protocol_version its hello answer claims (default: FAKE_MOSS_PROTOCOL)
   FAKE_MOSS_ABI         the abi_version in hello (default 1)
@@ -23,7 +23,12 @@ Environment:
                         gets the error code `internal`
 
 `inspect` (with the capability) answers from the file's safetensors metadata
-"fake_inspect" (a JSON object merged into the result); any other file is "unknown".
+"fake_inspect" (a JSON object merged into the result); any other file is "unknown",
+and a `.gguf` is a loadable DiT, as the real server says of a Q8_0 file.
+
+A `.gguf` dit_file needs `cache_dir`; its first generate sends the conversion's `dit_load`
+progress (fraction 0, eta null) before `plan`. A generate with `references` records
+{"method": "references_seen", "params": {"sizes": [[w, h], ...]}}: the images' PNG sizes, in order.
 
 Prompts with special words:
   CRASH          the process exits with status 134 during denoise
@@ -44,17 +49,17 @@ import threading
 import time
 import zlib
 
-DEFAULT_CAPS = "preview,model_files,lora,tiers,samplers,image_input,hires,distill,system_cuda,control,accel"
+DEFAULT_CAPS = "preview,model_files,lora,tiers,samplers,image_input,hires,distill,system_cuda,control,accel,references"
 ALL_CAPS = [
     "preview", "comfyui_models", "model_files", "lora", "tiers", "samplers", "image_input", "hires",
     "distill", "system_cuda", "control", "accel", "preload", "release", "certificate_dirs",
-    "te_host_pin", "progress_fraction", "inspect",
+    "te_host_pin", "progress_fraction", "inspect", "references", "check", "components",
 ]
 CAPS = {c: False for c in ALL_CAPS}
 for _c in os.environ.get("FAKE_MOSS_CAPS", DEFAULT_CAPS).split(","):
     if _c.strip():
         CAPS[_c.strip()] = True
-VERSION = os.environ.get("FAKE_MOSS_VERSION", "2.0.0")
+VERSION = os.environ.get("FAKE_MOSS_VERSION", "2.1.1")
 PROTOCOL = int(os.environ.get("FAKE_MOSS_PROTOCOL", "2"))
 HELLO_PROTOCOL = int(os.environ.get("FAKE_MOSS_HELLO_PROTOCOL", str(PROTOCOL)))
 ABI = int(os.environ.get("FAKE_MOSS_ABI", "1"))
@@ -70,6 +75,7 @@ VALUES = {
     "scheduler": ["moss", "simple", "normal", "karras", "exponential", "beta", "sgm_uniform"],
     "noise_layout": ["official", "batch_stream"], "noise_source": ["philox", "philox_device", "brownian_tree"],
     "resize": ["crop", "fit", "stretch"], "mask_encoding": ["u8", "binary01"], "step_cache": ["off", "fbcache"],
+    "lora_placement": ["default", "merge", "side_branch"],
 }
 for _drop in filter(None, os.environ.get("FAKE_MOSS_VALUES_DROP", "").split(",")):
     _k, _v = _drop.split(":")
@@ -101,16 +107,30 @@ GEN_PARAMS = {
     "distill": {"distill"},
     "control": {"control"},
     "accel": {"cfg_truncation", "step_cache", "step_cache_threshold"},
+    "references": {"references", "lora_placement"},
 }
 MODES = {"min_memory", "balanced", "max_speed"}
 TIERS = {"reference", "high", "turbo"}
 SAMPLERS = {"euler", "ab2", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde", "res_multistep", "dataspace"}
 SCHEDULERS = {"moss", "simple", "normal", "karras", "exponential", "beta", "sgm_uniform"}
+GGUF_DIT = {"kind": "dit", "loadable": True, "precision": "int8", "tensors": 379,
+            "note": "converted once at load into the cache directory (cache_dir), then loaded as that format: "
+                    "VRAM and speed are the format's",
+            "quantization": "GGUF Q8_0 + BF16 + F32, runs as INT8 ConvRot", "tiers": ["high"],
+            "tier_reasons": {
+                "reference": "tier reference runs bf16 weights, but the GGUF DiT is Q8_0 + BF16 + F32, which runs as "
+                             "INT8 ConvRot (tier high); tier reference reads GGUF files whose every tensor is BF16, "
+                             "F16 or F32",
+                "high": "High tier: INT8 ConvRot GEMMs, 8-bit attention (q8_fp8; q8_fp16 on GPUs without FP8) "
+                        "(GGUF Q8_0 + BF16 + F32, runs as INT8 ConvRot)",
+                "turbo": "tier turbo runs a 4-bit DiT, but the GGUF DiT is Q8_0 + BF16 + F32, which runs as INT8 "
+                         "ConvRot (tier high); use tier high"}}
 
 out_lock = threading.Lock()
 state_lock = threading.Lock()
 engine = None  # the load params
 job = None  # {"id", "kind", "cancel": Event, "step", "total"}
+converted = set()  # GGUF dit_files whose first load already ran
 
 
 def send(msg):
@@ -157,6 +177,11 @@ def png_bytes(width, height, rgb):
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b"")
 
 
+def png_size(path):
+    with open(path, "rb") as f:
+        return list(struct.unpack(">II", f.read(24)[16:24]))
+
+
 def write_png(path, width, height, rgb):
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
@@ -171,6 +196,8 @@ def fake_inspect(path):
     except OSError:
         return None
     result = {"path": path, "kind": "unknown", "loadable": False, "file_bytes": size, "tensors": 0, "note": ""}
+    if path.lower().endswith(".gguf"):
+        return dict(result, **GGUF_DIT)
     try:
         with open(path, "rb") as f:
             (n,) = struct.unpack("<Q", f.read(8))
@@ -228,6 +255,23 @@ def validate_generate(p, need_output=True):
         for i, img in enumerate(c.get("images", [])):
             if not os.path.isfile(img.get("path", "")):
                 raise ParamError(f"control.images[{i}].path: file not found: {img.get('path')}")
+    if "lora_placement" in p and p["lora_placement"] not in VALUES["lora_placement"]:
+        raise ParamError('"lora_placement" must be one of ' + ", ".join(VALUES["lora_placement"]))
+    r = p.get("references")
+    if r is not None:
+        if set(r) - {"images", "max_edge"}:
+            raise ParamError(f"references: unknown member in {sorted(r)}")
+        images = r.get("images")
+        if not isinstance(images, list) or not 1 <= len(images) <= 4:
+            raise ParamError('references: "images" must hold 1 to 4 paths')
+        for i, path in enumerate(images):
+            if not os.path.isfile(path):
+                raise ParamError(f"references.images[{i}]: file not found: {path}")
+        max_edge = r.get("max_edge", 512)
+        if not isinstance(max_edge, int) or not 16 <= max_edge <= 2048:
+            raise ParamError('references: "max_edge" must be an integer in [16, 2048]')
+        if p.get("slg_scale", 0) > 0:
+            raise ParamError("references: not with slg_scale > 0")
     if "preview_every" in p and "preview_output" not in p:
         raise ParamError("preview_every needs preview_output")
 
@@ -275,6 +319,13 @@ def run_generate(j, p):
         finish(j, {"event": "done", "id": j["id"], "status": "cancelled", "steps_run": steps_run,
               "report": {"cancelled": True, "steps_run": steps_run}, "warnings": []})
 
+    dit = engine.get("dit_file", "")
+    if dit.lower().endswith(".gguf") and dit not in converted:
+        converted.add(dit)
+        j["phase"] = "dit_load"
+        for _ in range(2):  # the conversion, before `plan`
+            progress(j["id"], "dit_load", 0, total, elapsed(), 0)
+            time.sleep(DELAY)
     send({"event": "plan", "id": j["id"], "explanation": "fake plan", "plan": {"mode": engine.get("mode", "balanced")}})
     units = total + 3
     for i, phase in enumerate(("text_encoder", "dit_load")):
@@ -448,6 +499,9 @@ def handle(msg):
             if not os.path.isdir(model):
                 engine = None
                 return err("invalid_argument", f"model: no such directory: {model}")
+            if p.get("dit_file", "").lower().endswith(".gguf") and not p.get("cache_dir"):
+                engine = None
+                return err("invalid_argument", "a GGUF dit_file needs cache_dir")
             for k in ("dit_file", "text_encoder_file", "vae_file"):
                 if k in p and not os.path.isfile(p[k]):
                     engine = None
@@ -506,6 +560,9 @@ def handle(msg):
                 j = {"id": req_id, "kind": method, "cancel": threading.Event(), "step": 0, "total": p.get("steps", 50),
                      "prompt": p.get("prompt", "")}
                 job = j
+            if "references" in p:
+                record(json.dumps({"method": "references_seen",
+                                   "params": {"sizes": [png_size(path) for path in p["references"]["images"]]}}))
             ok({"accepted": True})
             fn = run_generate if method == "generate" else run_preload
             threading.Thread(target=worker, args=(j, fn, p), daemon=True).start()

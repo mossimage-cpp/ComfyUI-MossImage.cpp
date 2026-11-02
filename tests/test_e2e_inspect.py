@@ -34,6 +34,8 @@ def comfy(tmp_path_factory):
     fake_model_file(os.path.join(models, "diffusion_models", "int8.safetensors"), INT8_DIT, metadata=INT8_HEADER)
     fake_model_file(os.path.join(models, "diffusion_models", "int4.safetensors"), INT4_DIT, metadata=INT4_HEADER)
     fake_model_file(os.path.join(models, "diffusion_models", "lora_as_dit.safetensors"), LORA)
+    with open(os.path.join(models, "diffusion_models", "q8.gguf"), "wb") as f:
+        f.write(b"GGUF")
     fake_model_file(os.path.join(models, "vae", "te_as_vae.safetensors"), {"kind": "text_encoder", "loadable": True,
                                                                          "precision": "int8", "quantization": "int8_convrot"})
     fake_model_file(os.path.join(models, "loras", "good.safetensors"), LORA)
@@ -42,11 +44,11 @@ def comfy(tmp_path_factory):
     fake_model_file(os.path.join(models, "loras", "control.safetensors"), CONTROL)
     os.makedirs(os.path.join(base, "input"))
     Image.new("RGB", (64, 48), (128, 128, 128)).save(os.path.join(base, "input", "depth.png"))
-    env = dict(os.environ, MOSSINFER_SERVER=make_fake_server(str(tmp / "bin")),
+    env = dict(os.environ, MOSSIMAGE_CPP_SERVER=make_fake_server(str(tmp / "bin")),
                FAKE_MOSS_RECORD=str(tmp / "requests.jsonl"), FAKE_MOSS_STEP_DELAY="0.01",
                FAKE_MOSS_CAPS="preview,model_files,lora,tiers,samplers,image_input,hires,control,accel,release,"
-                              "progress_fraction,inspect",
-               FAKE_MOSS_VALUES="1", FAKE_MOSS_VALUES_DROP="sampler:heun",
+                              "progress_fraction,inspect,references,check,components",
+               FAKE_MOSS_VALUES="1", FAKE_MOSS_VALUES_DROP="sampler:heun,lora_placement:side_branch",
                FAKE_MOSS_INSPECT_DELAY="0.1")  # a file named slow_*: 1 s
     marker = tmp / "before-start"
     marker.write_text("")
@@ -61,8 +63,8 @@ def comfy(tmp_path_factory):
 
 def workflow(comfy, seed, loader=None, **gen):
     prompt = copy.deepcopy(load_workflow_prompt(comfy))
-    find(prompt, "OwoInferMossImageModelLoader").update(loader or {})
-    g = find(prompt, "OwoInferMossImageGenerate")
+    find(prompt, "MossImageCppModelLoader").update(loader or {})
+    g = find(prompt, "MossImageCppGenerate")
     g.update({"width": 64, "height": 48, "steps": 3, "seed": seed})
     g.update(gen)
     return prompt
@@ -100,6 +102,13 @@ def test_tiers_the_dit_takes(comfy):
     ok(comfy, workflow(comfy, 4, {"dit_file": "int4.safetensors", "tier": "turbo"}))
 
 
+def test_tiers_of_a_gguf(comfy):
+    """Inspected like any DiT: a tier it does not run stops the run before anything converts."""
+    msg = run_error(comfy, workflow(comfy, 18, {"dit_file": "q8.gguf", "tier": "reference"}))
+    assert "dit_file q8.gguf: tier reference runs bf16 weights, but the GGUF DiT is Q8_0 + BF16 + F32" in msg
+    ok(comfy, workflow(comfy, 19, {"dit_file": "q8.gguf", "tier": "high"}))
+
+
 def test_wrong_kind_in_a_slot(comfy):
     msg = run_error(comfy, workflow(comfy, 5, {"dit_file": "lora_as_dit.safetensors"}))
     assert "dit_file lora_as_dit.safetensors is a LoRA, not a DiT" in msg
@@ -108,9 +117,9 @@ def test_wrong_kind_in_a_slot(comfy):
 
 
 def with_lora(prompt, name):
-    prompt["40"] = {"class_type": "OwoInferMossImageLoRA",
+    prompt["40"] = {"class_type": "MossImageCppLoRA",
                     "inputs": {"moss_model": ["1", 0], "lora_name": name, "strength": 1.0}}
-    find(prompt, "OwoInferMossImageGenerate")["moss_model"] = ["40", 0]
+    find(prompt, "MossImageCppGenerate")["moss_model"] = ["40", 0]
     return prompt
 
 
@@ -124,10 +133,10 @@ def test_loras(comfy):
 
 def with_control(prompt, kind):
     prompt["41"] = {"class_type": "LoadImage", "inputs": {"image": "depth.png"}}
-    prompt["42"] = {"class_type": "OwoInferMossImageControl",
+    prompt["42"] = {"class_type": "MossImageCppControl",
                     "inputs": {"adapter": "control.safetensors", "kind": kind, "image": ["41", 0], "strength": 1.0,
                                "start": 0.0, "end": 1.0, "lora_strength": 1.0}}
-    find(prompt, "OwoInferMossImageGenerate")["control"] = ["42", 0]
+    find(prompt, "MossImageCppGenerate")["control"] = ["42", 0]
     return prompt
 
 
@@ -141,9 +150,12 @@ def test_control_kinds(comfy):
 
 def test_name_the_server_lacks(comfy):
     msg = run_error(comfy, workflow(comfy, 12, sampler="heun"))
-    assert msg.rstrip("\n") == ("sampler 'heun' is not supported by this moss-server (2.0.0); it accepts: "
+    assert msg.rstrip("\n") == ("sampler 'heun' is not supported by this moss-server (2.1.1); it accepts: "
                                 "euler, ab2, euler_ancestral, dpmpp_2m, dpmpp_2m_sde, er_sde, res_multistep, dataspace")
     ok(comfy, workflow(comfy, 13, sampler="euler_ancestral"))
+    msg = run_error(comfy, workflow(comfy, 20, lora_placement="side_branch"))
+    assert msg.rstrip("\n") == "lora_placement 'side_branch' is not supported by this moss-server (2.1.1); it accepts: default, merge"
+    ok(comfy, workflow(comfy, 21, lora_placement="merge"))
 
 
 def test_unchecked_file_does_not_stop_the_run(comfy):
