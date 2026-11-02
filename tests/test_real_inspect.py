@@ -1,14 +1,14 @@
 """`inspect` and hello `values` from a real moss-server, on the community files. No GPU.
 
-Runs when MOSS_SERVER names a MossInfer 2.0 or later moss-server; skipped, saying so,
-otherwise. inspect reads file headers only and needs no engine.
+Runs when MOSS_SERVER names a mossimage.cpp 2.0 or later moss-server (2.1 for the GGUF
+and edit adapter tests); skipped, saying so, otherwise. inspect reads file headers only and needs no engine.
 """
 
 import os
 
 import pytest
 
-from helpers import COMFY_ORG, DIT_INT8, GPU_SERVER, LORA_4STEP, MODELS, TE_INT8
+from helpers import COMFY_ORG, DIT_INT8, EDIT_ADAPTER, GGUF_Q8, GPU_SERVER, LORA_4STEP, MODELS, TE_INT8
 from owoinfer_comfy import logic
 from owoinfer_comfy.logic import ControlImage, MossControl, MossModel
 from owoinfer_comfy.server import MossInferError, ServerManager
@@ -90,6 +90,38 @@ def test_the_node_lists_are_the_servers(session):
                           ("resize", logic.RESIZE_MODES), ("step_cache", logic.STEP_CACHES)):
         assert set(offered) <= set(values[name]), (name, offered, values[name])
     assert values["tier"] == logic.TIERS  # 2.0: exactly these, no `auto`
+
+
+def needs_21(session, *files):
+    if not session.has("references"):
+        pytest.skip(f"moss-server {session.version} is older than 2.1: no GGUF DiTs or reference images")
+    for f in files:
+        if not os.path.isfile(f):
+            pytest.skip(f"model file not on this machine: {f}")
+
+
+def test_gguf_dit(session):
+    needs_21(session, GGUF_Q8)
+    r = session.inspect([GGUF_Q8])[GGUF_Q8]
+    assert r["kind"] == "dit" and r["loadable"] and r["precision"] == "int8"
+    assert r["quantization"] == "GGUF Q8_0 + BF16 + F32, runs as INT8 ConvRot"
+    assert r["tiers"] == ["high"] and set(r["tier_reasons"]) == set(logic.TIERS)
+    name = os.path.basename(GGUF_Q8)
+    assert logic.inspected_problems(MossModel("/m", dit_file=GGUF_Q8, tier="high"), None, {GGUF_Q8: r}) == []
+    assert logic.inspected_problems(MossModel("/m", dit_file=GGUF_Q8, tier="reference"), None, {GGUF_Q8: r}) == [
+        f"dit_file {name}: " + r["tier_reasons"]["reference"]]
+
+
+def test_edit_adapter(session):
+    needs_21(session, EDIT_ADAPTER)
+    r = session.inspect([EDIT_ADAPTER])[EDIT_ADAPTER]
+    assert r["kind"] == "lora" and r["loadable"] and r["lora_rank"] > 0 and r["lora_unknown_keys"] == 0
+    assert logic.inspected_problems(MossModel("/m").with_lora(EDIT_ADAPTER, 1.0), None, {EDIT_ADAPTER: r}) == []
+
+
+def test_lora_placements_are_the_servers(session):
+    needs_21(session)
+    assert session.values["lora_placement"] == logic.LORA_PLACEMENTS
 
 
 def test_nvfp4(session):

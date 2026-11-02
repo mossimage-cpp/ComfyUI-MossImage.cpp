@@ -1,10 +1,13 @@
 [project]
-name = "ComfyUI-MossImage-owoinfer"
+name = "ComfyUI-MossImage.cpp"
 version = "0.1.0"
-description = "MOSS-Image in ComfyUI through owoinfer (MossInfer), a PyTorch-free C++/CUDA engine run as a sidecar process."
+description = "MOSS-Image in ComfyUI through mossimage.cpp, a PyTorch-free C++/CUDA engine run as a sidecar process."
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = []
 
+[project.urls]
+Repository = "https://github.com/mossimage-cpp/ComfyUI-MossImage.cpp"
+
 [tool.comfy]
-DisplayName = "ComfyUI-MossImage-owoinfer"
+DisplayName = "ComfyUI-MossImage.cpp"

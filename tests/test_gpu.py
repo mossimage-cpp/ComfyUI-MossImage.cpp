@@ -1,6 +1,6 @@
 """GPU smoke tests through headless ComfyUI with the real moss-server.
 
-Small on purpose: 256x256, 2 to 4 steps. Opt-in with OWOINFER_GPU_TESTS=1, run
+Small on purpose: 256x256, 2 to 4 steps. Opt-in with MOSSIMAGE_CPP_GPU_TESTS=1, run
 under the GPU lock (`flock /workspace/Projects/MossInfer/.gpu.lock pytest ...`).
 Skipped, with the reason, when a moss-server the tests did not start holds VRAM.
 """
@@ -16,7 +16,7 @@ import pytest
 from PIL import Image
 
 from comfy_harness import ComfyUI, comfyui_missing, find, install_changes, load_workflow_prompt, make_base
-from helpers import COMFY_ORG, GPU_SERVER, LORA_4STEP, MODELS, gpu_skip_reason
+from helpers import COMFY_ORG, EDIT_ADAPTER, GPU_SERVER, LORA_4STEP, MODELS, gpu_skip_reason
 
 pytestmark = pytest.mark.gpu
 
@@ -34,12 +34,13 @@ def comfy(tmp_path_factory):
     base = make_base(str(tmp / "base"))
     yaml = tmp / "extra_model_paths.yaml"
     yaml.write_text(
-        f"owoinfer_gpu:\n  base_path: {MODELS}\n  moss_image: MOSS-Image\n"
+        f"mossimage_gpu:\n  base_path: {MODELS}\n  moss_image: MOSS-Image\n"
         "  diffusion_models: community/comfy-org\n  text_encoders: community/comfy-org\n"
-        "  vae: community/comfy-org\n  loras: community/akhaliq/MOSS-Image-SFT-4-steps\n")
+        "  vae: community/comfy-org\n"
+        "  loras: |\n    community/akhaliq/MOSS-Image-SFT-4-steps\n    community/chinoll/Moss-Image-Edit\n")
     marker = tmp / "before-start"
     marker.write_text("")
-    c = ComfyUI(base, dict(os.environ, MOSSINFER_SERVER=GPU_SERVER),
+    c = ComfyUI(base, dict(os.environ, MOSSIMAGE_CPP_SERVER=GPU_SERVER),
                 extra_args=["--extra-model-paths-config", str(yaml), "--preview-method", "auto"])
     c.marker = str(marker)
     try:
@@ -51,8 +52,8 @@ def comfy(tmp_path_factory):
 
 def workflow(comfy, **gen):
     prompt = load_workflow_prompt(comfy)
-    find(prompt, "OwoInferMossImageModelLoader").update(model_folder="sft", dit_file=DIT, text_encoder_file=TE)
-    g = find(prompt, "OwoInferMossImageGenerate")
+    find(prompt, "MossImageCppModelLoader").update(model_folder="sft", dit_file=DIT, text_encoder_file=TE)
+    g = find(prompt, "MossImageCppGenerate")
     g.update(width=256, height=256, steps=4)
     g.update(gen)
     return prompt
@@ -83,7 +84,7 @@ def test_txt2img(comfy):
 def test_img2img(comfy):
     prompt = workflow(comfy, prompt="the same scene as a watercolor painting", denoise_strength=0.5, seed=3)
     prompt["20"] = {"class_type": "LoadImage", "inputs": {"image": "gpu_init.png"}}
-    find(prompt, "OwoInferMossImageGenerate")["init_image"] = ["20", 0]
+    find(prompt, "MossImageCppGenerate")["init_image"] = ["20", 0]
     entry = comfy.wait_history(comfy.queue(prompt), timeout=900)
     assert_ok(entry, comfy)
     _, pixels = output_image(comfy, entry)
@@ -94,14 +95,34 @@ def test_lora(comfy):
     if not os.path.isfile(LORA_4STEP):
         pytest.skip(f"LoRA not on this machine: {LORA_4STEP}")
     prompt = workflow(comfy, cfg=1.0, seed=4)
-    prompt["21"] = {"class_type": "OwoInferMossImageLoRA",
+    prompt["21"] = {"class_type": "MossImageCppLoRA",
                     "inputs": {"moss_model": ["1", 0], "lora_name": "lora.safetensors", "strength": 1.0}}
-    find(prompt, "OwoInferMossImageGenerate")["moss_model"] = ["21", 0]
+    find(prompt, "MossImageCppGenerate")["moss_model"] = ["21", 0]
     entry = comfy.wait_history(comfy.queue(prompt), timeout=900)
     assert_ok(entry, comfy)
     _, pixels = output_image(comfy, entry)
     assert pixels.std() > 0.05
     assert "MOSS-Image: seed 4, tier high" in comfy.log()
+
+
+def test_edit_adapter_with_a_reference(comfy):
+    if not os.path.isfile(EDIT_ADAPTER):
+        pytest.skip(f"edit adapter not on this machine: {EDIT_ADAPTER}")
+    prompt = workflow(comfy, prompt="make it a watercolor painting", seed=5, steps=3)
+    prompt["22"] = {"class_type": "MossImageCppLoRA",
+                    "inputs": {"moss_model": ["1", 0], "lora_name": "adapter_model.safetensors", "strength": 1.0}}
+    prompt["23"] = {"class_type": "LoadImage", "inputs": {"image": "gpu_init.png"}}
+    prompt["24"] = {"class_type": "MossImageCppReference", "inputs": {"image": ["23", 0], "max_edge": 256}}
+    g = find(prompt, "MossImageCppGenerate")
+    g["moss_model"] = ["22", 0]
+    g["references"] = ["24", 0]
+    entry = comfy.wait_history(comfy.queue(prompt), timeout=900)
+    assert_ok(entry, comfy)
+    _, pixels = output_image(comfy, entry)
+    assert pixels.shape == (256, 256, 3) and pixels.std() > 0.05
+    assert "MOSS-Image: seed 5, tier high" in comfy.log()
+    # the engine warns about an adapter without references, and references without an adapter
+    assert "used without reference images" not in comfy.log() and "without a moss-edit-lora adapter" not in comfy.log()
 
 
 def test_after_run_release(comfy):

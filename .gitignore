@@ -1,5 +1,5 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-# a MossInfer release extracted into the pack
+# a mossimage.cpp release (a mossinfer-* archive) extracted into the pack
 /bin/

@@ -1,7 +1,7 @@
 """moss-server sidecar client: locating, spawning, framing, one job at a time.
 
 Standard library only, with no ComfyUI imports, so it can be tested on its own.
-The protocol is MossInfer's docs/server-protocol.md (protocol 2).
+The protocol is mossimage.cpp's docs/server-protocol.md (protocol 2).
 """
 
 from __future__ import annotations
@@ -20,16 +20,16 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Iterator
 
-log = logging.getLogger("owoinfer")
+log = logging.getLogger("mossimage_cpp")
 
 PROTOCOL_VERSION = 2
 ABI_VERSION = 1
-NEEDS = f"the pack needs a MossInfer 2.x moss-server (protocol {PROTOCOL_VERSION}, engine ABI {ABI_VERSION})"
-CLIENT_NAME = "ComfyUI-MossImage-owoinfer"
-SERVER_ENV = "MOSSINFER_SERVER"
+NEEDS = f"the pack needs a mossimage.cpp 2.x moss-server (protocol {PROTOCOL_VERSION}, engine ABI {ABI_VERSION})"
+CLIENT_NAME = "ComfyUI-MossImage.cpp"
+SERVER_ENV = "MOSSIMAGE_CPP_SERVER"
 SERVER_EXE = "moss-server.exe" if os.name == "nt" else "moss-server"
 PACK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOG_NAME = "ComfyUI-MossImage-owoinfer.moss-server.log"
+LOG_NAME = "ComfyUI-MossImage.cpp.moss-server.log"
 
 REQUEST_TIMEOUT = 120.0  # hello, load, status, cancel, unload: all answer quickly
 SHUTDOWN_TIMEOUT = 5.0  # `shutdown` waits for a running job's cancel, then exits
@@ -97,7 +97,7 @@ def pack_server_candidates(pack_dir: str = PACK_DIR) -> list[str]:
 
 def locate_server(pack_dir: str = PACK_DIR, environ: dict[str, str] | None = None,
                   which: Callable[[str], str | None] = shutil.which) -> str:
-    """The moss-server to run: $MOSSINFER_SERVER, then the pack's bin/ folder, then PATH.
+    """The moss-server to run: $MOSSIMAGE_CPP_SERVER, then the pack's bin/ folder, then PATH.
 
     Never a value from a workflow: whoever controls the workflow would choose the program.
     """
@@ -115,7 +115,7 @@ def locate_server(pack_dir: str = PACK_DIR, environ: dict[str, str] | None = Non
         return os.path.abspath(on_path)
     raise ServerNotFound(
         f"{SERVER_EXE} not found. Looked at: the {SERVER_ENV} environment variable (unset); "
-        f"{os.path.join(pack_dir, 'bin', SERVER_EXE)} (extract a MossInfer release into "
+        f"{os.path.join(pack_dir, 'bin', SERVER_EXE)} (extract a mossimage.cpp release into "
         f"{os.path.join(pack_dir, 'bin')}); and PATH."
     )
 
@@ -708,7 +708,7 @@ class ServerManager:
             code, problem = "abi_mismatch", f"has engine ABI {hello.get('abi_version')}, not {ABI_VERSION}"
         if problem:
             self._discard_process()
-            raise MossInferError(code, f"{server_path} (MossInfer {hello.get('version')}) {problem}; {NEEDS}")
+            raise MossInferError(code, f"{server_path} (mossimage.cpp {hello.get('version')}) {problem}; {NEEDS}")
         self._hello = hello
         probe = hello.get("probe") or {}
         log.info("moss-server %s started (%s); %s", hello.get("version"), server_path, probe.get("message", ""))

@@ -1,6 +1,6 @@
 """Node logic without ComfyUI: protocol values, model config, request building.
 
-Values and ranges are those of MossInfer's docs/server-protocol.md (protocol 2).
+Values and ranges are those of mossimage.cpp's docs/server-protocol.md (protocol 2).
 """
 
 from __future__ import annotations
@@ -26,11 +26,13 @@ NOISE_SOURCES = ["philox", "philox_device", "brownian_tree"]
 RESIZE_MODES = ["crop", "fit", "stretch"]
 STEP_CACHES = ["off", "fbcache"]
 AFTER_RUN = ["keep", "release", "unload"]
+LORA_PLACEMENTS = ["default", "merge", "side_branch"]
 
 MAX_SIDE = 4096
 MAX_STEPS = 10000
 MAX_SEED = 2**53 - 1  # the server's browser-safe range
 MAX_SEQUENCE_LENGTH = 4096
+MAX_REFERENCES = 4
 
 # Generate params that only a server with the capability knows, with the protocol's
 # default: at the default they are left out, so older builds still accept the request.
@@ -43,6 +45,7 @@ GATED_DEFAULTS: dict[str, tuple[str, Any]] = {
     "s_noise": ("samplers", 1.0),
     "cfg_truncation": ("accel", 1.0),
     "step_cache": ("accel", "off"),
+    "lora_placement": ("references", "default"),
 }
 BASE_PARAMS = ["prompt", "negative_prompt", "width", "height", "steps", "cfg", "shift", "seed",
                "uncond_skip_layers", "slg_layers", "slg_scale", "slg_start", "slg_stop", "max_sequence_length"]
@@ -200,6 +203,22 @@ class MossControl:
                            for i, p in zip(self.images, image_paths)]}
 
 
+@dataclass
+class MossReferences:
+    """What MOSS-Image Reference hands on (ComfyUI type MOSS_REFERENCES): the source image first."""
+
+    max_edge: int = 512
+    images: tuple[Any, ...] = field(default=(), compare=False)  # ComfyUI IMAGE tensors
+
+    def with_image(self, image: Any) -> "MossReferences":
+        if len(self.images) >= MAX_REFERENCES:
+            raise ValueError(f"too many reference images: the engine takes at most {MAX_REFERENCES}")
+        return MossReferences(self.max_edge, self.images + (image,))
+
+    def to_param(self, image_paths: list[str]) -> dict[str, Any]:
+        return {"images": list(image_paths), "max_edge": self.max_edge}
+
+
 # generate --------------------------------------------------------------------------------
 
 def preview_every_for(width: int, height: int) -> int:
@@ -211,7 +230,8 @@ def build_generate_params(values: dict[str, Any], caps: dict[str, bool], version
                           output: str, preview_output: str | None = None,
                           init_image: str | None = None, mask: str | None = None,
                           loras: Iterable[tuple[str, float]] = (),
-                          control: dict[str, Any] | None = None) -> dict[str, Any]:
+                          control: dict[str, Any] | None = None,
+                          references: dict[str, Any] | None = None) -> dict[str, Any]:
     """The `generate` params for the node's widget values and the files written for it.
 
     Params a server without the capability does not know are left out at their
@@ -271,6 +291,11 @@ def build_generate_params(values: dict[str, Any], caps: dict[str, bool], version
             raise missing_capability("A control adapter", "control", version)
         p["control"] = control
 
+    if references is not None:
+        if not caps.get("references"):
+            raise missing_capability("A reference image", "references", version)
+        p["references"] = references
+
     if preview_output and caps.get("preview"):
         p["preview_output"] = preview_output
         p["preview_every"] = preview_every_for(values["width"], values["height"])
@@ -318,6 +343,10 @@ class ProgressMapper:
 
 def progress_text(event: dict[str, Any]) -> str:
     phase = str(event.get("phase", ""))
+    # A GGUF dit_file's first load: fraction 0 and no ETA, before `plan`. A library without
+    # progress fields sends a null fraction, which is not this.
+    if phase == "dit_load" and event.get("fraction") == 0 and event.get("eta_seconds") is None:
+        return "converting GGUF DiT (first load)"
     text = PHASE_LABELS.get(phase, phase)
     if phase == "denoise" and event.get("total_steps"):
         text += f" {event.get('step', 0)}/{event['total_steps']}"
@@ -400,7 +429,7 @@ def inspect_paths(model: "MossModel", control: "MossControl | None") -> list[str
 
 # load / generate params checked against hello's `values`, under the same names
 VALUE_CHECKS = {"load": ("mode", "tier", "attention"),
-                "generate": ("sampler", "scheduler", "resize", "step_cache", "noise_layout", "noise_source")}
+                "generate": ("sampler", "scheduler", "resize", "step_cache", "noise_layout", "noise_source", "lora_placement")}
 
 
 def value_problems(values: dict[str, list[str]], load_params: dict[str, Any],

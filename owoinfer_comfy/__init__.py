@@ -1,1 +1,1 @@
-"""ComfyUI-MossImage-owoinfer internals. Only nodes.py imports ComfyUI."""
+"""ComfyUI-MossImage.cpp internals. Only nodes.py imports ComfyUI."""

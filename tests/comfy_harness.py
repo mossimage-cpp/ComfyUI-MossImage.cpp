@@ -24,7 +24,7 @@ from helpers import ROOT
 
 COMFYUI_DIR = os.environ.get("COMFYUI_DIR", "/workspace/AI/ComfyUI")
 COMFYUI_PYTHON = os.environ.get("COMFYUI_PYTHON", os.path.join(COMFYUI_DIR, ".venv", "bin", "python"))
-PACK_NAME = "ComfyUI-MossImage-owoinfer"
+PACK_NAME = "ComfyUI-MossImage.cpp"
 WORKFLOW = os.path.join(ROOT, "example_workflows", "MOSS-Image_txt2img.json")
 
 
@@ -109,7 +109,7 @@ class ComfyUI:
         return json.loads(raw) if raw else None
 
     def queue(self, prompt, extra_data=None) -> str:
-        body = {"prompt": prompt, "client_id": "owoinfer-tests"}
+        body = {"prompt": prompt, "client_id": "mossimage-cpp-tests"}
         if extra_data:
             body["extra_data"] = extra_data
         return self.post("/prompt", body)["prompt_id"]
@@ -155,8 +155,9 @@ WIDGET_TYPES = {"INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"}
 def ui_to_api(workflow: dict, object_info: dict) -> dict:
     """A saved (UI) workflow to the API prompt format, by the nodes' widget order.
 
-    Fails on leftover or missing widget values, so a workflow out of step with
-    the node schemas is caught.
+    Fails on leftover values and on a required input without one, so a workflow
+    out of step with the node schemas is caught. An optional widget without a
+    value is left out: that is how a workflow saved before it existed loads.
     """
     links = {link[0]: link for link in workflow["links"]}
     prompt = {}
@@ -173,6 +174,8 @@ def ui_to_api(workflow: dict, object_info: dict) -> dict:
             spec = specs[name]
             if isinstance(spec[0], list) or spec[0] in WIDGET_TYPES:
                 if not values:
+                    if name in info["input"].get("optional", {}):
+                        continue
                     raise ValueError(f"node {node['id']} ({node['type']}): no widget value for {name}")
                 inputs[name] = values.pop(0)
                 if len(spec) > 1 and spec[1].get("control_after_generate"):

@@ -74,7 +74,7 @@ def test_locate_bad_env(tmp_path):
 
 def test_spawn_hello_and_parent_pid(manager, fake_server, fake_env):
     with manager.session(fake_server) as s:
-        assert s.version == "2.0.0"
+        assert s.version == "2.1.1"
         assert s.has("control") and not s.has("release")
     argv = [p for m, p in recorded(fake_env) if m == "argv"][0]
     assert argv == ["--parent-pid", str(os.getpid())]
@@ -82,7 +82,7 @@ def test_spawn_hello_and_parent_pid(manager, fake_server, fake_env):
     assert hello == {"client": srv.CLIENT_NAME, "protocol_version": 2}
     # stderr went to the log file
     with open(manager.log_path) as f:
-        assert "fake moss-server 2.0.0 starting" in f.read()
+        assert "fake moss-server 2.1.1 starting" in f.read()
 
 
 def test_one_process_reused_and_load_only_on_change(manager, fake_server, fake_env, tmp_path):
@@ -311,7 +311,7 @@ def test_crash_then_restart(manager, fake_server, fake_env, tmp_path):
         assert load(s, tmp_path) is True  # the new process needs its own load
         assert s.run_job("generate", gen_params(tmp_path))["status"] == "ok"
     with open(manager.log_path) as f:
-        assert f.read().count("fake moss-server 2.0.0 starting") == 2
+        assert f.read().count("fake moss-server 2.1.1 starting") == 2
 
 
 def test_cuda_error_restarts_process(manager, fake_server, tmp_path):
@@ -408,7 +408,7 @@ def test_unload_then_load_again(manager, fake_server, fake_env, tmp_path):
 
 
 def test_replaced_lora_needs_no_reload(manager, fake_server, fake_env, tmp_path):
-    """MossInfer 2.0 reads a LoRA replaced under the same name anew: the engine stays loaded."""
+    """The engine reads a LoRA replaced under the same name anew: the engine stays loaded."""
     lora = tmp_path / "style.safetensors"
     lora.write_bytes(b"one")
     with manager.session(fake_server) as s:

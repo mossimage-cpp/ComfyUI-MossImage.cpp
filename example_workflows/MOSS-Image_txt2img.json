@@ -4,7 +4,7 @@
   "nodes": [
     {
       "id": 1,
-      "type": "OwoInferMossImageModelLoader",
+      "type": "MossImageCppModelLoader",
       "pos": [40, 120],
       "size": [360, 250],
       "flags": {},
@@ -12,12 +12,12 @@
       "mode": 0,
       "inputs": [],
       "outputs": [{"name": "moss_model", "type": "MOSS_MODEL", "links": [1], "slot_index": 0}],
-      "properties": {"Node name for S&R": "OwoInferMossImageModelLoader"},
+      "properties": {"Node name for S&R": "MossImageCppModelLoader"},
       "widgets_values": ["MOSS-Image-SFT", "(from folder)", "(from folder)", "(from folder)", "balanced", "high", "default"]
     },
     {
       "id": 2,
-      "type": "OwoInferMossImageGenerate",
+      "type": "MossImageCppGenerate",
       "pos": [440, 120],
       "size": [420, 520],
       "flags": {},
@@ -30,7 +30,7 @@
         {"name": "control", "type": "MOSS_CONTROL", "link": null, "shape": 7}
       ],
       "outputs": [{"name": "image", "type": "IMAGE", "links": [2], "slot_index": 0}],
-      "properties": {"Node name for S&R": "OwoInferMossImageGenerate"},
+      "properties": {"Node name for S&R": "MossImageCppGenerate"},
       "widgets_values": [
         "a red fox sitting in a snowy forest at dawn, soft golden light, detailed fur",
         "",

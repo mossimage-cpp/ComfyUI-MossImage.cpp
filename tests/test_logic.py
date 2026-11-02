@@ -7,11 +7,11 @@ import pytest
 
 from helpers import make_bundle, recorded
 from owoinfer_comfy import logic
-from owoinfer_comfy.logic import ControlImage, MossControl, MossModel, ProgressMapper
+from owoinfer_comfy.logic import ControlImage, MossControl, MossModel, MossReferences, ProgressMapper
 from owoinfer_comfy.server import MossInferError, ServerManager
 
 ALL = {c: True for c in ("preview", "model_files", "lora", "tiers", "samplers", "image_input", "hires",
-                         "distill", "control", "accel", "release", "preload", "progress_fraction")}
+                         "distill", "control", "accel", "release", "preload", "progress_fraction", "references")}
 OLD = {"preview": True, "model_files": True, "lora": True, "tiers": True}  # a minimal build
 
 
@@ -123,6 +123,20 @@ def test_control_chain():
         c.with_image(ControlImage("depth", None))
 
 
+def test_references_chain():
+    empty = MossReferences(256)
+    first = empty.with_image("source")
+    r = first.with_image("other")
+    assert r.images == ("source", "other") and r.max_edge == 256
+    # A node's output is not changed by the next node: one output can feed several chains.
+    assert empty.images == () and first.images == ("source",)
+    assert r.to_param(["/s.png", "/o.png"]) == {"images": ["/s.png", "/o.png"], "max_edge": 256}
+    assert MossReferences().max_edge == 512
+    four = r.with_image("c").with_image("d")
+    with pytest.raises(ValueError, match="at most 4"):
+        four.with_image("e")
+
+
 # generate params ----------------------------------------------------------------------------
 
 def test_generate_params_full_build():
@@ -172,6 +186,24 @@ def test_generate_params_refuses_files_the_server_lacks():
             logic.build_generate_params(values(), {}, "0.1", output="/o.png", **kw)
 
 
+def test_generate_params_references():
+    refs = {"images": ["/s.png"], "max_edge": 512}
+    p = logic.build_generate_params(values(), ALL, "2.1.1", output="/o.png", references=refs)
+    assert p["references"] == refs and p["lora_placement"] == "default"
+    assert "references" not in logic.build_generate_params(values(), ALL, "2.1.1", output="/o.png")
+    with pytest.raises(MossInferError) as e:
+        logic.build_generate_params(values(), OLD, "2.0.0", output="/o.png", references=refs)
+    assert e.value.code == "not_supported" and "'references'" in str(e.value) and "2.0.0" in str(e.value)
+
+
+def test_generate_params_lora_placement():
+    assert logic.build_generate_params(values(lora_placement="merge"), ALL, "2.1.1", output="/o.png")["lora_placement"] == "merge"
+    assert "lora_placement" not in logic.build_generate_params(values(), OLD, "2.0.0", output="/o.png")
+    with pytest.raises(MossInferError) as e:
+        logic.build_generate_params(values(lora_placement="merge"), OLD, "2.0.0", output="/o.png")
+    assert e.value.code == "not_supported" and "lora_placement 'merge'" in str(e.value) and "'references'" in str(e.value)
+
+
 def test_generate_params_hires_needs_both_sides():
     with pytest.raises(MossInferError, match="both hires_width and hires_height"):
         logic.build_generate_params(values(hires_width=512), ALL, "1", output="/o.png")
@@ -209,6 +241,54 @@ def test_old_server_accepts_what_is_built_for_it(tmp_path, fake_server, fake_env
     assert any(meth == "generate" for meth, _ in recorded(env))
 
 
+def test_references_reach_the_server(tmp_path, fake_server, fake_env):
+    from PIL import Image
+    source = tmp_path / "source.png"
+    Image.new("RGB", (32, 16)).save(source)
+    m = ServerManager(log_dir=str(tmp_path / "l"), env=fake_env)
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    try:
+        with m.session(fake_server) as s:
+            assert s.has("references")
+            s.ensure_loaded(MossModel(str(bundle)).load_params(s.capabilities, s.version))
+            refs = MossReferences(256).with_image(None).to_param([str(source)])
+            p = logic.build_generate_params(values(lora_placement="side_branch"), s.capabilities, s.version,
+                                            output=str(tmp_path / "o.png"), references=refs)
+            assert s.run_job("generate", p)["status"] == "ok"
+            with pytest.raises(MossInferError, match="not with slg_scale"):  # the server's rule, not the pack's
+                s.run_job("generate", dict(p, slg_scale=1.0))
+    finally:
+        m.shutdown()
+    sent = [p for meth, p in recorded(fake_env) if meth == "generate"][0]
+    assert sent["references"] == refs and sent["lora_placement"] == "side_branch"
+    assert [p for meth, p in recorded(fake_env) if meth == "references_seen"][0]["sizes"] == [[32, 16]]
+
+
+def test_gguf_conversion_progress(tmp_path, fake_server, fake_env):
+    """The fake sends the conversion's progress on the first load only, before `plan`."""
+    env = dict(fake_env, FAKE_MOSS_CAPS="preview,model_files,lora,tiers,samplers,progress_fraction")
+    m = ServerManager(log_dir=str(tmp_path / "l"), cache_dir=str(tmp_path / "cache"), env=env)
+    bundle, gguf = tmp_path / "bundle", tmp_path / "q8.gguf"
+    bundle.mkdir()
+    gguf.write_bytes(b"GGUF")
+    label = "converting GGUF DiT (first load)"
+    try:
+        with m.session(fake_server) as s:
+            s.ensure_loaded(MossModel(str(bundle), dit_file=str(gguf)).load_params(s.capabilities, s.version, m.cache_dir))
+            p = logic.build_generate_params(values(), s.capabilities, s.version, output=str(tmp_path / "o.png"))
+            runs = [[], []]
+            for run in runs:
+                def on_event(e, run=run):
+                    run.append(logic.progress_text(e) if e["event"] == "progress" else e["event"])
+                assert s.run_job("generate", p, on_event=on_event)["status"] == "ok"
+    finally:
+        m.shutdown()
+    assert runs[0][:3] == [label, label, "plan"]
+    assert "loading DiT" in " ".join(runs[0][3:]) and label not in runs[0][3:]
+    assert label not in runs[1]
+
+
 # progress -------------------------------------------------------------------------------------
 
 def test_progress_steps():
@@ -234,6 +314,20 @@ def test_progress_text():
     assert logic.progress_text({"phase": "dit_load", "step": 0, "total_steps": 4}) == "loading DiT"
     assert logic.progress_text({"phase": "denoise", "step": 2, "total_steps": 4, "eta_seconds": 12.4}) == "denoise 2/4 · ETA 12 s"
     assert logic.progress_text({"phase": "denoise", "step": 2, "total_steps": 4, "eta_seconds": None}) == "denoise 2/4"
+
+
+def test_progress_text_gguf_conversion():
+    label = "converting GGUF DiT (first load)"
+    assert logic.progress_text({"phase": "dit_load", "step": 0, "fraction": 0, "eta_seconds": None}) == label
+    assert logic.progress_text({"phase": "dit_load", "step": 0, "fraction": 0.0, "eta_seconds": None}) == label
+    # a library without progress fields: null, not 0
+    assert logic.progress_text({"phase": "dit_load", "step": 0, "fraction": None, "eta_seconds": None}) == "loading DiT"
+    # an ordinary DiT load
+    assert logic.progress_text({"phase": "dit_load", "step": 0, "fraction": 0.4, "eta_seconds": None}) == "loading DiT"
+    assert logic.progress_text({"phase": "dit_load", "step": 0, "fraction": 0.4, "eta_seconds": 3.0}) == "loading DiT · ETA 3 s"
+    assert logic.progress_text({"phase": "dit_load", "step": 0, "fraction": 0, "eta_seconds": 3.0}) == "loading DiT · ETA 3 s"
+    # another phase at the job's start
+    assert logic.progress_text({"phase": "text_encoder", "step": 0, "fraction": 0, "eta_seconds": None}) == "text encoder"
 
 
 # inspect results and hello values -----------------------------------------------------
@@ -286,3 +380,6 @@ def test_value_problems():
         "attention 'q8_fp8' is not supported by this moss-server (1.0.9); it accepts: default, exact",
         "sampler 'heun' is not supported by this moss-server (1.0.9); it accepts: euler, ab2"]
     assert logic.value_problems({}, load, gen, "1.0.0") == []  # no `values`: nothing to check
+    assert logic.value_problems({"lora_placement": ["default"]}, load, dict(gen, lora_placement="merge"), "2.1.1") == [
+        "lora_placement 'merge' is not supported by this moss-server (2.1.1); it accepts: default"]
+    assert logic.value_problems({"lora_placement": logic.LORA_PLACEMENTS}, load, dict(gen, lora_placement="merge"), "2.1.1") == []
